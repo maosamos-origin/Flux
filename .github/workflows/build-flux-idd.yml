@@ -68,8 +68,8 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path $vswhere)) { throw "vswhere.exe was not found: $vswhere" }
           & $vswhere -all -products * -format json
-          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\Current\Bin\MSBuild.exe' | Select-Object -First 1
-          if (-not $msbuild -or -not (Test-Path $msbuild)) { throw 'Visual Studio MSBuild was not found.' }
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\Current\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild -or -not (Test-Path $msbuild)) { throw 'Visual Studio x64 MSBuild was not found.' }
           "MSBUILD=$msbuild" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $msbuild -version
           Write-Host '=== Windows SDK directories ==='
@@ -84,18 +84,28 @@ jobs:
           $iddcxHeader = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter iddcx.h -ErrorAction SilentlyContinue | Select-Object -First 1
           $iddcxLib = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter IddCxStub.lib -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '\\arm64\\' } | Select-Object -First 1
+          $infVerifExe = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter InfVerif.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          $infVerifDll = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter InfVerif.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
           $driverKitTasks = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Recurse -Filter Microsoft.DriverKit.Build.Tasks.18.0.dll -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $iddcxHeader) { throw 'iddcx.h was not found in the installed SDK/WDK.' }
           if (-not $iddcxLib) { throw 'ARM64 IddCxStub.lib was not found in the installed SDK/WDK.' }
+          if (-not $infVerifExe) { throw 'x64 InfVerif.exe was not found in the installed WDK.' }
+          if (-not $infVerifDll) { throw 'x64 InfVerif.dll was not found in the installed WDK.' }
           if (-not $driverKitTasks) { throw 'Microsoft.DriverKit.Build.Tasks.18.0.dll was not found in the installed WDK.' }
           "IDDCX_HEADER=$($iddcxHeader.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "IDDCX_LIB=$($iddcxLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "DRIVERKIT_TASKS_18=$($driverKitTasks.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "iddcx.h: $($iddcxHeader.FullName)"
           Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
+          Write-Host "x64 InfVerif.exe: $($infVerifExe.FullName)"
+          Write-Host "x64 InfVerif.dll: $($infVerifDll.FullName)"
           Write-Host "DriverKit Build Tasks 18: $($driverKitTasks.FullName)"
           $commonTargets = Join-Path (Split-Path (Split-Path $driverKitTasks.FullName -Parent) -Parent) 'WindowsDriver.common.targets'
           if (-not (Test-Path $commonTargets)) { throw "WindowsDriver.common.targets was not found: $commonTargets" }
+          Write-Host 'WindowsDriver.common.targets lines 694-704:'
+          (Get-Content $commonTargets | Select-Object -Skip 693 -First 11) | ForEach-Object { Write-Host $_ }
           $validateUsingTask = Select-String -Path $commonTargets -Pattern 'ValidateNTTargetVersion|Microsoft.DriverKit.Build.Tasks.18.0.dll' | Select-Object -First 1
           if (-not $validateUsingTask) { throw "ValidateNTTargetVersion UsingTask declaration was not found: $commonTargets" }
           Write-Host "ValidateNTTargetVersion UsingTask: $($validateUsingTask.Line.Trim())"
