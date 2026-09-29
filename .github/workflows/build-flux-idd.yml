@@ -93,7 +93,9 @@ jobs:
             Where-Object { $_.FullName -match '\\Hostx64\\arm64\\cl.exe$' } | Select-Object -First 1
           if (-not $arm64Compiler) { throw 'MSVC Hostx64/arm64 compiler was not found.' }
           Write-Host "ARM64 compiler: $($arm64Compiler.FullName)"
-          & $arm64Compiler.FullName /Bv
+          $compilerInfo = (Get-Item $arm64Compiler.FullName).VersionInfo
+          Write-Host "ARM64 compiler FileVersion: $($compilerInfo.FileVersion)"
+          Write-Host "ARM64 compiler ProductVersion: $($compilerInfo.ProductVersion)"
           $arm64MsvcLib = Get-ChildItem "$env:VS_INSTALL_PATH\VC\Tools\MSVC" -Directory |
             ForEach-Object { Join-Path $_.FullName 'lib\arm64' } | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $arm64MsvcLib) { throw 'MSVC ARM64 library directory was not found.' }
