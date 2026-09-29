@@ -23,10 +23,40 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Inspect Visual Studio ARM64 component inventory
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe was not found: $vswhere" }
+          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsInstallPath -or -not (Test-Path $vsInstallPath)) { throw 'Visual Studio installation with MSBuild was not found.' }
+          $arm64Component = 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+          $arm64InstalledPath = & $vswhere -latest -products * -requires $arm64Component -property installationPath
+          Write-Host "Visual Studio installation: $vsInstallPath"
+          Write-Host "Required ARM64 component: $arm64Component"
+          Write-Host "ARM64 component already installed: $([bool]$arm64InstalledPath)"
+          "VS_INSTALL_PATH=$vsInstallPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ARM64_MSVC_COMPONENT=$arm64Component" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install Windows 11 WDK for ARM64 IddCx
         run: |
           $ErrorActionPreference = 'Stop'
           winget install --exact --id Microsoft.WindowsWDK.10.0.26100 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+
+      - name: Install MSVC ARM64 cross tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installed = & $vswhere -latest -products * -requires $env:ARM64_MSVC_COMPONENT -property installationPath
+          if (-not $installed) {
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+            if (-not (Test-Path $installer)) { throw "Visual Studio Installer was not found: $installer" }
+            & $installer modify --installPath $env:VS_INSTALL_PATH --add $env:ARM64_MSVC_COMPONENT --quiet --wait --norestart
+            if ($LASTEXITCODE -ne 0) { throw "Visual Studio ARM64 component installation failed with exit code $LASTEXITCODE." }
+          }
+          $installed = & $vswhere -latest -products * -requires $env:ARM64_MSVC_COMPONENT -property installationPath
+          if (-not $installed) { throw "Required Visual Studio component was not installed: $env:ARM64_MSVC_COMPONENT" }
+          Write-Host "ARM64 MSVC component installed in: $installed"
 
       - name: Audit Visual Studio, SDK, WDK, and IddCx inputs
         run: |
@@ -59,10 +89,15 @@ jobs:
           "IDDCX_LIB=$($iddcxLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "iddcx.h: $($iddcxHeader.FullName)"
           Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
-          $arm64Compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue |
+          $arm64Compiler = Get-ChildItem "$env:VS_INSTALL_PATH\VC\Tools\MSVC" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '\\Hostx64\\arm64\\cl.exe$' } | Select-Object -First 1
           if (-not $arm64Compiler) { throw 'MSVC Hostx64/arm64 compiler was not found.' }
           Write-Host "ARM64 compiler: $($arm64Compiler.FullName)"
+          & $arm64Compiler.FullName /Bv
+          $arm64MsvcLib = Get-ChildItem "$env:VS_INSTALL_PATH\VC\Tools\MSVC" -Directory |
+            ForEach-Object { Join-Path $_.FullName 'lib\arm64' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $arm64MsvcLib) { throw 'MSVC ARM64 library directory was not found.' }
+          Write-Host "ARM64 MSVC libraries: $arm64MsvcLib"
 
       - name: Build Debug ARM64 driver and preserve full log
         run: |
