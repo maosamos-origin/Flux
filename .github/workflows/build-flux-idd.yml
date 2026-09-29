@@ -38,10 +38,11 @@ jobs:
           "VS_INSTALL_PATH=$vsInstallPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ARM64_MSVC_COMPONENT=$arm64Component" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install Windows 11 WDK for ARM64 IddCx
+      - name: Install Windows 11 26H1 SDK and WDK for VS18 IddCx
         run: |
           $ErrorActionPreference = 'Stop'
-          winget install --exact --id Microsoft.WindowsWDK.10.0.26100 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+          winget install --exact --id Microsoft.WindowsSDK.10.0.28000 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+          winget install --exact --id Microsoft.WindowsWDK.10.0.28000 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
 
       - name: Install MSVC ARM64 cross tools
         run: |
@@ -83,12 +84,21 @@ jobs:
           $iddcxHeader = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter iddcx.h -ErrorAction SilentlyContinue | Select-Object -First 1
           $iddcxLib = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter IddCxStub.lib -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '\\arm64\\' } | Select-Object -First 1
+          $driverKitTasks = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Recurse -Filter Microsoft.DriverKit.Build.Tasks.18.0.dll -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $iddcxHeader) { throw 'iddcx.h was not found in the installed SDK/WDK.' }
           if (-not $iddcxLib) { throw 'ARM64 IddCxStub.lib was not found in the installed SDK/WDK.' }
+          if (-not $driverKitTasks) { throw 'Microsoft.DriverKit.Build.Tasks.18.0.dll was not found in the installed WDK.' }
           "IDDCX_HEADER=$($iddcxHeader.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "IDDCX_LIB=$($iddcxLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DRIVERKIT_TASKS_18=$($driverKitTasks.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "iddcx.h: $($iddcxHeader.FullName)"
           Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
+          Write-Host "DriverKit Build Tasks 18: $($driverKitTasks.FullName)"
+          $commonTargets = Join-Path (Split-Path (Split-Path $driverKitTasks.FullName -Parent) -Parent) 'WindowsDriver.common.targets'
+          if (-not (Test-Path $commonTargets)) { throw "WindowsDriver.common.targets was not found: $commonTargets" }
+          $validateUsingTask = Select-String -Path $commonTargets -Pattern 'ValidateNTTargetVersion|Microsoft.DriverKit.Build.Tasks.18.0.dll' | Select-Object -First 1
+          if (-not $validateUsingTask) { throw "ValidateNTTargetVersion UsingTask declaration was not found: $commonTargets" }
+          Write-Host "ValidateNTTargetVersion UsingTask: $($validateUsingTask.Line.Trim())"
           $arm64Compiler = Get-ChildItem "$env:VS_INSTALL_PATH\VC\Tools\MSVC" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '\\Hostx64\\arm64\\cl.exe$' } | Select-Object -First 1
           if (-not $arm64Compiler) { throw 'MSVC Hostx64/arm64 compiler was not found.' }
