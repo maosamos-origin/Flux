@@ -157,9 +157,10 @@ jobs:
           Write-Host "Selected dumpbin.exe: $($dumpbin.FullName)"
           & $dumpbin.FullName /headers $dll.FullName 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\dumpbin-headers.log
           if (-not ((Get-Content .artifacts\FluxIdd\dumpbin-headers.log -Raw) -match 'ARM64')) { throw 'FluxIdd.dll is not ARM64.' }
-          $infVerif = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter InfVerif.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $infVerif) { throw 'InfVerif.exe was not found in the installed WDK.' }
-          & $infVerif.FullName /v "$driverRoot\FluxIdd.inf" 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\infverif.log
+          $infVerif = Join-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.28000.0\x64" 'infverif.exe'
+          if (-not (Test-Path $infVerif)) { throw "x64 InfVerif.exe was not found: $infVerif" }
+          Write-Host "Selected InfVerif.exe: $infVerif"
+          & $infVerif /v "$driverRoot\FluxIdd.inf" 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\infverif.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not ((Get-Content "$driverRoot\FluxIdd.inf" -Raw) -match 'ROOT\\FLUX_IDD')) { throw 'ROOT\\FLUX_IDD binding was not preserved.' }
 
