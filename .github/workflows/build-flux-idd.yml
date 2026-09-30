@@ -70,6 +70,7 @@ jobs:
           & $vswhere -all -products * -format json
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\Current\Bin\amd64\MSBuild.exe' | Select-Object -First 1
           if (-not $msbuild -or -not (Test-Path $msbuild)) { throw 'Visual Studio x64 MSBuild was not found.' }
+          if ($msbuild -notmatch '\\MSBuild\\Current\\Bin\\amd64\\MSBuild\.exe$') { throw "Selected MSBuild is not x64: $msbuild" }
           "MSBUILD=$msbuild" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $msbuild -version
           Write-Host '=== Windows SDK directories ==='
@@ -93,11 +94,18 @@ jobs:
           "DRIVERKIT_TASKS_18=$($driverKitTasks.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "iddcx.h: $($iddcxHeader.FullName)"
           Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
-          Write-Host '=== All installed InfVerif.exe paths ==='
-          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter InfVerif.exe -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-          Write-Host '=== All installed InfVerif.dll paths ==='
-          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter InfVerif.dll -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          $wdkBuildRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.28000.0"
+          $wdkToolsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.28000.0"
+          $infVerifExe = "$wdkToolsRoot\x64\infverif.exe"
+          $infVerifDll = "$wdkBuildRoot\bin\x64\infverif.dll"
+          $infVerifHlkDll = "$wdkBuildRoot\bin\x64\infverifhlk.dll"
+          $packageVerifierTasks = "$wdkBuildRoot\bin\Microsoft.DriverKit.Build.Tasks.PackageVerifier.18.0.dll"
+          @($infVerifExe,$infVerifDll,$infVerifHlkDll,$driverKitTasks.FullName,$packageVerifierTasks) | ForEach-Object { if (-not (Test-Path $_)) { throw "Required WDK runtime file was not found: $_" } }
+          Write-Host "x64 InfVerif.exe: $infVerifExe"
+          Write-Host "x64 InfVerif.dll: $infVerifDll"
+          Write-Host "x64 InfVerifHLK.dll: $infVerifHlkDll"
           Write-Host "DriverKit Build Tasks 18: $($driverKitTasks.FullName)"
+          Write-Host "PackageVerifier Tasks 18: $packageVerifierTasks"
           $commonTargets = Join-Path (Split-Path (Split-Path $driverKitTasks.FullName -Parent) -Parent) 'WindowsDriver.common.targets'
           if (-not (Test-Path $commonTargets)) { throw "WindowsDriver.common.targets was not found: $commonTargets" }
           $taskAssemblyDirectory = Split-Path $driverKitTasks.FullName -Parent
@@ -128,7 +136,6 @@ jobs:
           Write-Host "ARM64 MSVC libraries: $arm64MsvcLib"
 
       - name: Build Debug ARM64 driver and preserve full log
-        if: ${{ false }}
         run: |
           $ErrorActionPreference = 'Continue'
           New-Item -ItemType Directory -Force -Path .artifacts\FluxIdd | Out-Null
@@ -137,7 +144,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Validate ARM64 result and INF
-        if: ${{ false }}
         run: |
           $ErrorActionPreference = 'Stop'
           $driverRoot = 'Guest\Windows\FluxIdd'
