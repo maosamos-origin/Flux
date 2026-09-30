@@ -149,9 +149,12 @@ jobs:
           $driverRoot = 'Guest\Windows\FluxIdd'
           $dll = Get-ChildItem $driverRoot -Recurse -Filter FluxIdd.dll | Select-Object -First 1
           if (-not $dll) { throw 'FluxIdd.dll was not produced by the ARM64 build.' }
-          $dumpbin = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin.exe$' } | Select-Object -First 1
+          $dumpbins = Get-ChildItem $env:VS_INSTALL_PATH -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue
+          Write-Host 'Available dumpbin.exe paths:'
+          $dumpbins | ForEach-Object { Write-Host $_.FullName }
+          $dumpbin = $dumpbins | Sort-Object @{ Expression = { if ($_.FullName -match '\\Hostx64\\x64\\dumpbin.exe$') { 0 } else { 1 } } }, FullName | Select-Object -First 1
           if (-not $dumpbin) { throw 'dumpbin.exe was not found for binary architecture validation.' }
+          Write-Host "Selected dumpbin.exe: $($dumpbin.FullName)"
           & $dumpbin.FullName /headers $dll.FullName 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\dumpbin-headers.log
           if (-not ((Get-Content .artifacts\FluxIdd\dumpbin-headers.log -Raw) -match 'ARM64')) { throw 'FluxIdd.dll is not ARM64.' }
           $infVerif = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter InfVerif.exe -ErrorAction SilentlyContinue | Select-Object -First 1
