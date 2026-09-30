@@ -21,7 +21,7 @@ NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
     FluxGetMonitorContext(output.MonitorObject)->monitor = output.MonitorObject;
     IDARG_OUT_MONITORARRIVAL arrival = {}; return IddCxMonitorArrival(output.MonitorObject, &arrival);
 }
-NTSTATUS FluxIddMonitorGetDefaultModes(IDDCX_MONITOR, const IDARG_IN_GETMONITORDESCRIPTIONMODES* input, IDARG_OUT_GETMONITORDESCRIPTIONMODES* output) {
+NTSTATUS FluxIddMonitorGetDefaultModes(IDDCX_MONITOR, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* input, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* output) {
     output->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(kFluxIddModeCount);
     if (input->DefaultMonitorModeBufferInputCount >= kFluxIddModeCount) for (size_t i = 0; i < kFluxIddModeCount; ++i) input->pDefaultMonitorModes[i] = FluxIddMakeMonitorMode(kFluxIddModes[i]);
     return STATUS_SUCCESS;
