@@ -12,8 +12,11 @@ IDDCX_MONITOR_MODE FluxIddMakeMonitorMode(const FluxIddMode& mode) { IDDCX_MONIT
 IDDCX_TARGET_MODE FluxIddMakeTargetMode(const FluxIddMode& mode) { IDDCX_TARGET_MODE out = {}; out.Size = sizeof(out); FillSignalInfo(&out.TargetVideoSignalInfo.targetVideoSignalInfo, mode, false); return out; }
 NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
     WDF_OBJECT_ATTRIBUTES attributes; WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FluxMonitorContext);
-    IDARG_IN_MONITORCREATE input = {}; input.Size = sizeof(input); input.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
-    input.ConnectorIndex = 0; input.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_UNINITIALIZED; input.ObjectAttributes = &attributes;
+    IDDCX_MONITOR_INFO monitorInfo = {}; monitorInfo.Size = sizeof(monitorInfo);
+    monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER; monitorInfo.ConnectorIndex = 0;
+    monitorInfo.MonitorDescription.Size = sizeof(monitorInfo.MonitorDescription);
+    monitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_UNINITIALIZED;
+    IDARG_IN_MONITORCREATE input = {}; input.ObjectAttributes = &attributes; input.pMonitorInfo = &monitorInfo;
     IDARG_OUT_MONITORCREATE output = {}; NTSTATUS status = IddCxMonitorCreate(adapter, &input, &output); if (!NT_SUCCESS(status)) return status;
     FluxGetMonitorContext(output.MonitorObject)->monitor = output.MonitorObject;
     IDARG_OUT_MONITORARRIVAL arrival = {}; return IddCxMonitorArrival(output.MonitorObject, &arrival);
