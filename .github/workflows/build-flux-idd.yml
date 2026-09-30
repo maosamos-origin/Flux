@@ -149,6 +149,9 @@ jobs:
           $driverRoot = 'Guest\Windows\FluxIdd'
           $dll = Get-ChildItem $driverRoot -Recurse -Filter FluxIdd.dll | Select-Object -First 1
           if (-not $dll) { throw 'FluxIdd.dll was not produced by the ARM64 build.' }
+          $stampedInf = Join-Path $driverRoot 'ARM64\Debug\FluxIdd.inf'
+          if (-not (Test-Path $stampedInf)) { throw "Stamped INF was not produced: $stampedInf" }
+          Write-Host "Selected stamped INF: $stampedInf"
           $dumpbins = Get-ChildItem $env:VS_INSTALL_PATH -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue
           Write-Host 'Available dumpbin.exe paths:'
           $dumpbins | ForEach-Object { Write-Host $_.FullName }
@@ -160,9 +163,9 @@ jobs:
           $infVerif = Join-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.28000.0\x64" 'infverif.exe'
           if (-not (Test-Path $infVerif)) { throw "x64 InfVerif.exe was not found: $infVerif" }
           Write-Host "Selected InfVerif.exe: $infVerif"
-          & $infVerif /v "$driverRoot\FluxIdd.inf" 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\infverif.log
+          & $infVerif /v $stampedInf 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\infverif.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not ((Get-Content "$driverRoot\FluxIdd.inf" -Raw) -match 'ROOT\\FLUX_IDD')) { throw 'ROOT\\FLUX_IDD binding was not preserved.' }
+          if (-not ((Get-Content $stampedInf -Raw) -match 'ROOT\\FLUX_IDD')) { throw 'ROOT\\FLUX_IDD binding was not preserved.' }
 
       - name: Collect driver package outputs
         if: always()
