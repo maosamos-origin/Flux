@@ -5,10 +5,12 @@ on:
   push:
     paths:
       - 'Guest/Windows/FluxIdd/**'
+      - 'Guest/Windows/Tools/**'
       - '.github/workflows/build-flux-idd.yml'
   pull_request:
     paths:
       - 'Guest/Windows/FluxIdd/**'
+      - 'Guest/Windows/Tools/**'
       - '.github/workflows/build-flux-idd.yml'
 
 jobs:
@@ -167,6 +169,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not ((Get-Content $stampedInf -Raw) -match 'ROOT\\FLUX_IDD')) { throw 'ROOT\\FLUX_IDD binding was not preserved.' }
 
+      - name: Build ARM64 devcon and preserve full log
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path .artifacts\Tools | Out-Null
+          $toolsOut = (Resolve-Path .artifacts\Tools).Path
+          & .\Guest\Windows\Tools\devcon\build-devcon.ps1 -Configuration Release -Platform ARM64 -OutputDir $toolsOut 2>&1 |
+            Tee-Object -FilePath .artifacts\Tools\build-devcon.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Collect driver package outputs
         if: always()
         run: |
@@ -174,6 +185,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path .artifacts\FluxIdd\package | Out-Null
           Get-ChildItem Guest\Windows\FluxIdd -Recurse -Include FluxIdd.dll,FluxIdd.inf,FluxIdd.cat,FluxIdd.pdb -ErrorAction SilentlyContinue |
             Copy-Item -Destination .artifacts\FluxIdd\package -Force
+          if (Test-Path .artifacts\Tools\devcon.exe) {
+            Copy-Item .artifacts\Tools\devcon.exe -Destination .artifacts\FluxIdd\package -Force
+          }
 
       - name: Upload ARM64 Debug driver artifacts and logs
         if: always()
@@ -182,4 +196,4 @@ jobs:
           name: FluxIdd-ARM64-Debug
           if-no-files-found: warn
           path: |
-            .artifacts/FluxIdd/**
+            .artifacts/**
