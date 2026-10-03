@@ -41,8 +41,8 @@ bool ContainsHardwareId(const BYTE* data, DWORD byteCount, const std::wstring& w
     return false;
 }
 
-bool HardwareIdAlreadyExists(const std::wstring& hardwareId, bool* alreadyExists) {
-    *alreadyExists = false;
+bool CountHardwareIds(const std::wstring& hardwareId, DWORD* count) {
+    *count = 0;
     HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(nullptr, nullptr, nullptr,
                                                    DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (deviceInfoSet == INVALID_HANDLE_VALUE) {
@@ -94,8 +94,7 @@ bool HardwareIdAlreadyExists(const std::wstring& hardwareId, bool* alreadyExists
 
         if (propertyType == REG_MULTI_SZ &&
             ContainsHardwareId(hardwareIds.data(), requiredBytes, hardwareId)) {
-            *alreadyExists = true;
-            break;
+            ++*count;
         }
     }
 
@@ -158,8 +157,20 @@ bool CreateRootDevice(const std::wstring& hardwareId, const GUID& classGuid) {
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
+    if (argc == 3 && _wcsicmp(argv[1], L"count") == 0) {
+        DWORD count = 0;
+        if (!CountHardwareIds(argv[2], &count)) {
+            std::wcout << L"RESULT=FAIL" << std::endl;
+            return 1;
+        }
+        std::wcout << L"COUNT=" << count << std::endl;
+        std::wcout << L"RESULT=SUCCESS" << std::endl;
+        return 0;
+    }
+
     if (argc != 4 || _wcsicmp(argv[1], L"create") != 0) {
-        std::wcerr << L"Usage: FluxDevNode.exe create <hardware-id> <class-guid>" << std::endl;
+        std::wcerr << L"Usage: FluxDevNode.exe count <hardware-id>" << std::endl;
+        std::wcerr << L"   or: FluxDevNode.exe create <hardware-id> <class-guid>" << std::endl;
         return 2;
     }
 
@@ -173,11 +184,12 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"REQUESTED_HARDWARE_ID=" << hardwareId << std::endl;
     std::wcout << L"REQUESTED_CLASS_GUID=" << argv[3] << std::endl;
 
-    bool alreadyExists = false;
-    if (!HardwareIdAlreadyExists(hardwareId, &alreadyExists)) {
+    DWORD existingCount = 0;
+    if (!CountHardwareIds(hardwareId, &existingCount)) {
         std::wcout << L"RESULT=FAIL" << std::endl;
         return 1;
     }
+    const bool alreadyExists = existingCount != 0;
     std::wcout << L"ALREADY_EXISTS=" << (alreadyExists ? L"YES" : L"NO") << std::endl;
     if (alreadyExists) {
         std::wcout << L"RESULT=ALREADY_EXISTS" << std::endl;
