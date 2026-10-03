@@ -137,6 +137,15 @@ jobs:
           if (-not $arm64MsvcLib) { throw 'MSVC ARM64 library directory was not found.' }
           Write-Host "ARM64 MSVC libraries: $arm64MsvcLib"
 
+      - name: Build ARM64 FluxDevNode helper and preserve full log
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path .artifacts\Tools\FluxDevNode | Out-Null
+          $toolsOut = (Resolve-Path .artifacts\Tools\FluxDevNode).Path
+          & .\Guest\Windows\Tools\FluxDevNode\build-flux-devnode.ps1 -Configuration Release -Platform ARM64 -OutputDir $toolsOut 2>&1 |
+            Tee-Object -FilePath .artifacts\Tools\build-flux-devnode.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build Debug ARM64 driver and preserve full log
         run: |
           $ErrorActionPreference = 'Continue'
@@ -187,6 +196,9 @@ jobs:
             Copy-Item -Destination .artifacts\FluxIdd\package -Force
           if (Test-Path .artifacts\Tools\devcon.exe) {
             Copy-Item .artifacts\Tools\devcon.exe -Destination .artifacts\FluxIdd\package -Force
+          }
+          if (Test-Path .artifacts\Tools\FluxDevNode\FluxDevNode.exe) {
+            Copy-Item .artifacts\Tools\FluxDevNode\FluxDevNode.exe -Destination .artifacts\FluxIdd\package -Force
           }
 
       - name: Upload ARM64 Debug driver artifacts and logs
