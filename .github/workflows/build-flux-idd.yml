@@ -194,6 +194,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: FluxIdd-ARM64-Debug
-          if-no-files-found: warn
+          if-no-files-found: error
+          include-hidden-files: true
           path: |
-            .artifacts/**
+            .artifacts/FluxIdd/**
+            .artifacts/Tools/**
