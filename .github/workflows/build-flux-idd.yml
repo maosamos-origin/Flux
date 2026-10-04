@@ -187,20 +187,123 @@ jobs:
             Tee-Object -FilePath .artifacts\Tools\build-devcon.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Collect driver package outputs
+      - name: Collect driver package from the single WDK package directory
         if: always()
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path .artifacts\FluxIdd\package | Out-Null
-          Get-ChildItem Guest\Windows\FluxIdd -Recurse -Include FluxIdd.dll,FluxIdd.inf,FluxIdd.cat,FluxIdd.pdb -ErrorAction SilentlyContinue |
-            Copy-Item -Destination .artifacts\FluxIdd\package -Force
-          if (Test-Path .artifacts\Tools\devcon.exe) {
-            Copy-Item .artifacts\Tools\devcon.exe -Destination .artifacts\FluxIdd\package -Force
-          }
-          if (Test-Path .artifacts\Tools\FluxDevNode\FluxDevNode.exe) {
-            Copy-Item .artifacts\Tools\FluxDevNode\FluxDevNode.exe -Destination .artifacts\FluxIdd\package -Force
+          $pkg  = 'Guest\Windows\FluxIdd\ARM64\Debug\FluxIdd'
+          $dest = '.artifacts\FluxIdd\package'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Write-Host "Package source directory: $pkg"
+          if (-not (Test-Path -LiteralPath $pkg)) { throw "Package directory missing: $pkg" }
+          Get-ChildItem -LiteralPath $pkg -Force | Format-Table Name, Length, LastWriteTime | Out-String | Write-Host
+          foreach ($n in 'FluxIdd.inf','FluxIdd.dll','FluxIdd.cat') {
+            $src = Join-Path $pkg $n
+            if (-not (Test-Path -LiteralPath $src)) { throw "Required package file missing: $src" }
+            Copy-Item -LiteralPath $src -Destination $dest -Force
           }
 
+          $symDir = '.artifacts\FluxIdd\symbols'
+          New-Item -ItemType Directory -Force -Path $symDir | Out-Null
+          $pdb = Join-Path $pkg 'FluxIdd.pdb'
+          if (Test-Path -LiteralPath $pdb) {
+            Copy-Item -LiteralPath $pdb -Destination $symDir -Force
+          } else {
+            Write-Host 'FluxIdd.pdb not in package directory (diagnostic only, not required).'
+          }
+
+      - name: Validate packaged artifact (INF, DLL, CAT coherence)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $pkgSrc = 'Guest\Windows\FluxIdd\ARM64\Debug\FluxIdd'
+          $d   = '.artifacts\FluxIdd\package'
+          $inf = Join-Path $d 'FluxIdd.inf'
+          $dll = Join-Path $d 'FluxIdd.dll'
+          $cat = Join-Path $d 'FluxIdd.cat'
+
+          foreach ($f in @($inf,$dll,$cat)) {
+            if (-not (Test-Path -LiteralPath $f)) { throw "Missing artifact file: $f" }
+          }
+
+          function Find-Tool($name) {
+            foreach ($r in @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "${env:ProgramFiles(x86)}\Windows Kits\10\Tools")) {
+              if (Test-Path $r) {
+                $f = Get-ChildItem $r -Recurse -Filter $name -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match '\\x64\\' } |
+                     Sort-Object FullName -Descending |
+                     Select-Object -First 1
+                if ($f) { return $f.FullName }
+              }
+            }
+            throw "$name not found in Windows Kits"
+          }
+
+          function Run-Strict($label, $exe, $argList) {
+            $o = & $exe @argList 2>&1
+            $code = $LASTEXITCODE
+            Write-Host "== $label (exit $code) =="
+            ($o | Out-String) | Write-Host
+            if ($code -ne 0) { throw "$label FAILED (exit $code)" }
+          }
+
+          foreach ($n in 'FluxIdd.inf','FluxIdd.dll','FluxIdd.cat') {
+            $a = (Get-FileHash -LiteralPath (Join-Path $d $n) -Algorithm SHA256).Hash
+            $b = (Get-FileHash -LiteralPath (Join-Path $pkgSrc $n) -Algorithm SHA256).Hash
+            Write-Host "$n artifact=$a source-package=$b"
+            if ($a -ne $b) { throw "$n differs from the package directory copy" }
+          }
+
+          $stamped = 'Guest\Windows\FluxIdd\ARM64\Debug\FluxIdd.inf'
+          if (Test-Path $stamped) {
+            $h1 = (Get-FileHash $stamped -Algorithm SHA256).Hash
+            $h2 = (Get-FileHash $inf -Algorithm SHA256).Hash
+            Write-Host "stamped INF=$h1 artifact INF=$h2"
+            if ($h1 -ne $h2) { throw 'Artifact INF differs from the stamped INF used by Inf2Cat' }
+          }
+
+          $txt = Get-Content -LiteralPath $inf -Raw
+          if ($txt -notmatch '(?im)^\s*Class\s*=\s*Display\s*$') { throw 'INF: Class=Display missing' }
+          if ($txt -notmatch '(?im)^\s*ClassGuid\s*=\s*\{4D36E968-E325-11CE-BFC1-08002BE10318\}\s*$') { throw 'INF: ClassGuid mismatch' }
+          if ($txt -notmatch 'ROOT\\FLUX_IDD') { throw 'INF: ROOT\FLUX_IDD missing' }
+          if ($txt -notmatch '(?im)^\s*UmdfLibraryVersion\s*=\s*2\.25\.0\s*$') { throw 'INF: UmdfLibraryVersion=2.25.0 missing' }
+          if ($txt.Contains('$UMDFVERSION$')) { throw 'INF still contains $UMDFVERSION$ (unstamped)' }
+
+          $m = [regex]::Match($txt, '(?im)^\s*DriverVer\s*=\s*(\S+)\s*$')
+          if (-not $m.Success) { throw 'INF: DriverVer missing' }
+          Write-Host "Packaged DriverVer: $($m.Groups[1].Value)"
+          if ($m.Groups[1].Value -eq '09/28/2026,0.1.0.0') {
+            throw 'Source (unstamped) DriverVer was packaged'
+          }
+
+          $infVerif = Find-Tool 'infverif.exe'
+          Run-Strict 'InfVerif artifact INF' $infVerif @('/v', $inf)
+
+          $b = [System.IO.File]::ReadAllBytes((Resolve-Path $dll))
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          Write-Host ('DLL PE machine: 0x{0:X4}' -f $machine)
+          if ($machine -ne 0xAA64) { throw 'DLL is not ARM64' }
+
+          $sDll = Get-AuthenticodeSignature -FilePath $dll
+          $sCat = Get-AuthenticodeSignature -FilePath $cat
+          Write-Host "DLL signer: $($sDll.SignerCertificate.Thumbprint) $($sDll.SignerCertificate.Subject)"
+          Write-Host "CAT signer: $($sCat.SignerCertificate.Thumbprint) $($sCat.SignerCertificate.Subject)"
+
+          if (-not $sDll.SignerCertificate -or -not $sCat.SignerCertificate) {
+            throw 'DLL or CAT is not signed'
+          }
+
+          if ($sDll.SignerCertificate.Thumbprint -ne $sCat.SignerCertificate.Thumbprint) {
+            throw 'DLL and CAT signers differ'
+          }
+
+          $signtool = Find-Tool 'signtool.exe'
+          Run-Strict 'signtool verify DLL' $signtool @('verify','/v','/pa',$dll)
+          Run-Strict 'signtool verify CAT' $signtool @('verify','/v','/pa',$cat)
+          Run-Strict 'catalog membership DLL' $signtool @('verify','/v','/pa','/c',$cat,$dll)
+          Run-Strict 'catalog membership INF' $signtool @('verify','/v','/pa','/c',$cat,$inf)
+
+          Write-Host 'PACKAGE COHERENCE: PASS'
       - name: Upload ARM64 Debug driver artifacts and logs
         if: always()
         uses: actions/upload-artifact@v4
