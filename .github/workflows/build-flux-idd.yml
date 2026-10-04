@@ -298,10 +298,10 @@ jobs:
           }
 
           $signtool = Find-Tool 'signtool.exe'
-          Run-Strict 'signtool verify DLL' $signtool @('verify','/v','/pa',$dll)
-          Run-Strict 'signtool verify CAT' $signtool @('verify','/v','/pa',$cat)
-          Run-Strict 'catalog membership DLL' $signtool @('verify','/v','/pa','/c',$cat,$dll)
-          Run-Strict 'catalog membership INF' $signtool @('verify','/v','/pa','/c',$cat,$inf)
+          Run-Strict 'signtool verify DLL' $signtool @('verify','/v',$dll)
+          Run-Strict 'signtool verify CAT' $signtool @('verify','/v',$cat)
+          Run-Strict 'catalog membership DLL' $signtool @('verify','/v','/c',$cat,$dll)
+          Run-Strict 'catalog membership INF' $signtool @('verify','/v','/c',$cat,$inf)
 
           Write-Host 'PACKAGE COHERENCE: PASS'
       - name: Upload ARM64 Debug driver artifacts and logs
