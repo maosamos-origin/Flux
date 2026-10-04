@@ -116,7 +116,7 @@ bool CreateRootDevice(const std::wstring& hardwareId, const GUID& classGuid) {
 
     SP_DEVINFO_DATA deviceInfoData{};
     deviceInfoData.cbSize = sizeof(deviceInfoData);
-    if (!SetupDiCreateDeviceInfoW(deviceInfoSet, hardwareId.c_str(), &classGuid, nullptr,
+    if (!SetupDiCreateDeviceInfoW(deviceInfoSet, L"Display", &classGuid, nullptr,
                                   nullptr, DICD_GENERATE_ID, &deviceInfoData)) {
         std::wcout << L"CREATE_DEVICE_INFO=FAIL" << std::endl;
         PrintWin32Failure(L"SetupDiCreateDeviceInfo", GetLastError());
