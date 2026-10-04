@@ -297,11 +297,44 @@ jobs:
             throw 'DLL and CAT signers differ'
           }
 
-          $signtool = Find-Tool 'signtool.exe'
-          Run-Strict 'signtool verify DLL' $signtool @('verify','/v',$dll)
-          Run-Strict 'signtool verify CAT' $signtool @('verify','/v',$cat)
-          Run-Strict 'catalog membership DLL' $signtool @('verify','/v','/c',$cat,$dll)
-          Run-Strict 'catalog membership INF' $signtool @('verify','/v','/c',$cat,$inf)
+          $signer = $sDll.SignerCertificate
+          if ($signer.Subject -notmatch 'WDKTestCert') {
+            throw "Unexpected package signer subject: $($signer.Subject)"
+          }
+          if ($signer.Subject -ne $signer.Issuer) {
+            throw "WDK test certificate is not self-signed: Subject=$($signer.Subject) Issuer=$($signer.Issuer)"
+          }
+
+          $rootStore = 'Cert:\CurrentUser\Root'
+          $tempCert = Join-Path $env:RUNNER_TEMP "FluxIdd-WDKTestCert-$($signer.Thumbprint).cer"
+          $existingRoot = @(Get-ChildItem -Path $rootStore | Where-Object { $_.Thumbprint -eq $signer.Thumbprint })
+          $temporaryRootTrustAdded = $false
+
+          try {
+            [System.IO.File]::WriteAllBytes(
+              $tempCert,
+              $signer.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+
+            if ($existingRoot.Count -eq 0) {
+              Import-Certificate -FilePath $tempCert -CertStoreLocation $rootStore -ErrorAction Stop | Out-Null
+              $temporaryRootTrustAdded = $true
+              Write-Host "Temporarily trusted WDK test certificate in CurrentUser\\Root: $($signer.Thumbprint)"
+            } else {
+              Write-Host "WDK test certificate already trusted in CurrentUser\\Root: $($signer.Thumbprint)"
+            }
+
+            $signtool = Find-Tool 'signtool.exe'
+            Run-Strict 'signtool verify DLL' $signtool @('verify','/v','/pa',$dll)
+            Run-Strict 'signtool verify CAT' $signtool @('verify','/v','/pa',$cat)
+            Run-Strict 'catalog membership DLL' $signtool @('verify','/v','/pa','/c',$cat,$dll)
+            Run-Strict 'catalog membership INF' $signtool @('verify','/v','/pa','/c',$cat,$inf)
+          } finally {
+            if ($temporaryRootTrustAdded) {
+              Remove-Item -LiteralPath (Join-Path $rootStore $signer.Thumbprint) -Force -ErrorAction Stop
+              Write-Host "Removed temporary WDK test certificate from CurrentUser\\Root: $($signer.Thumbprint)"
+            }
+            Remove-Item -LiteralPath $tempCert -Force -ErrorAction SilentlyContinue
+          }
 
           Write-Host 'PACKAGE COHERENCE: PASS'
       - name: Upload ARM64 Debug driver artifacts and logs
