@@ -154,6 +154,70 @@ bool CreateRootDevice(const std::wstring& hardwareId, const GUID& classGuid) {
     return true;
 }
 
+
+bool QueryHardwareId(const wchar_t* hardwareId) {
+    HDEVINFO set = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES);
+    if (set == INVALID_HANDLE_VALUE) {
+        PrintWin32Failure(L"SetupDiGetClassDevs(query)", GetLastError());
+        return false;
+    }
+    DWORD matches = 0;
+    for (DWORD i = 0;; ++i) {
+        SP_DEVINFO_DATA d{};
+        d.cbSize = sizeof(d);
+        if (!SetupDiEnumDeviceInfo(set, i, &d)) {
+            if (GetLastError() == ERROR_NO_MORE_ITEMS) break;
+            PrintWin32Failure(L"SetupDiEnumDeviceInfo(query)", GetLastError());
+            SetupDiDestroyDeviceInfoList(set);
+            return false;
+        }
+        DWORD type = 0, bytes = 0;
+        SetupDiGetDeviceRegistryPropertyW(set, &d, SPDRP_HARDWAREID, &type, nullptr, 0, &bytes);
+        if (bytes == 0) continue;
+        std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 2, L'\0');
+        if (!SetupDiGetDeviceRegistryPropertyW(set, &d, SPDRP_HARDWAREID, &type,
+                                               reinterpret_cast<PBYTE>(buf.data()), bytes, nullptr) ||
+            type != REG_MULTI_SZ) continue;
+        bool hit = false;
+        for (const wchar_t* q = buf.data(); *q; q += wcslen(q) + 1) {
+            if (_wcsicmp(q, hardwareId) == 0) hit = true;
+        }
+        if (!hit) continue;
+        ++matches;
+
+        wchar_t instId[512] = {};
+        if (SetupDiGetDeviceInstanceIdW(set, &d, instId, 512, nullptr))
+            std::wcout << L"INSTANCE_ID=" << instId << std::endl;
+        else
+            std::wcout << L"INSTANCE_ID=ERROR_" << GetLastError() << std::endl;
+        std::wcout << L"HARDWARE_ID=" << hardwareId << std::endl;
+
+        wchar_t g[64] = {};
+        StringFromGUID2(d.ClassGuid, g, 64);
+        std::wcout << L"CLASS_GUID=" << g << std::endl;
+
+        wchar_t cname[256] = {};
+        if (SetupDiClassNameFromGuidW(&d.ClassGuid, cname, 256, nullptr))
+            std::wcout << L"CLASS_NAME=" << cname << std::endl;
+        else
+            std::wcout << L"CLASS_NAME=ERROR_" << GetLastError() << std::endl;
+
+        wchar_t prop[128] = {};
+        DWORD pt = 0;
+        if (SetupDiGetDeviceRegistryPropertyW(set, &d, SPDRP_CLASSGUID, &pt,
+                                              reinterpret_cast<PBYTE>(prop), sizeof(prop) - sizeof(wchar_t), nullptr))
+            std::wcout << L"SPDRP_CLASSGUID=" << prop << std::endl;
+        else
+            std::wcout << L"SPDRP_CLASSGUID=NOT_SET_ERROR_" << GetLastError() << std::endl;
+    }
+    std::wcout << L"MATCH_COUNT=" << matches << std::endl;
+    if (!SetupDiDestroyDeviceInfoList(set)) {
+        PrintWin32Failure(L"SetupDiDestroyDeviceInfoList(query)", GetLastError());
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -164,6 +228,15 @@ int wmain(int argc, wchar_t* argv[]) {
             return 1;
         }
         std::wcout << L"COUNT=" << count << std::endl;
+        std::wcout << L"RESULT=SUCCESS" << std::endl;
+        return 0;
+    }
+
+    if (argc == 3 && _wcsicmp(argv[1], L"query") == 0) {
+        if (!QueryHardwareId(argv[2])) {
+            std::wcout << L"RESULT=FAIL" << std::endl;
+            return 1;
+        }
         std::wcout << L"RESULT=SUCCESS" << std::endl;
         return 0;
     }
