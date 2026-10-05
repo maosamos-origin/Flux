@@ -395,6 +395,9 @@ jobs:
           Write-Host "CATALOG MEMBERSHIP: $catalogMembership"
           Write-Host "CI TRUST CHAIN: $trustChain"
           Write-Host 'PACKAGE COHERENCE: PASS'
+          # All fail-fast checks above use throw. Clear stale $LASTEXITCODE left by the
+          # tolerated signtool.exe trust-unverified calls so the step reports success.
+          exit 0
       - name: Upload ARM64 Debug driver artifacts and logs
         if: always()
         uses: actions/upload-artifact@v4
