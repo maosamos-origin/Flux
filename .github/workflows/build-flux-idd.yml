@@ -316,7 +316,7 @@ jobs:
             $knownTrustError = 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider.'
             $errorCount = [regex]::Matches($text, '(?im)^SignTool Error:').Count
             if ($errorCount -eq 1 -and $text.Contains($knownTrustError)) {
-              Write-Host "$label: CI TRUST-UNVERIFIED (self-signed WDK test certificate)"
+              Write-Host "${label}: CI TRUST-UNVERIFIED (self-signed WDK test certificate)"
               return 'UNVERIFIED'
             }
             throw "$label FAILED (exit $code)"
