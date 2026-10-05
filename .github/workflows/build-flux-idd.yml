@@ -309,13 +309,14 @@ jobs:
             $o = & $exe @argList 2>&1
             $code = $LASTEXITCODE
             $text = $o | Out-String
+            $normalized = [regex]::Replace($text, '\s+', ' ').Trim()
             Write-Host "== $label (exit $code) =="
             Write-Host $text
             if ($code -eq 0) { return 'PASS' }
 
             $knownTrustError = 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider.'
             $errorCount = [regex]::Matches($text, '(?im)^SignTool Error:').Count
-            if ($errorCount -eq 1 -and $text.Contains($knownTrustError)) {
+            if ($errorCount -eq 1 -and $normalized.Contains($knownTrustError)) {
               Write-Host "${label}: CI TRUST-UNVERIFIED (self-signed WDK test certificate)"
               return 'UNVERIFIED'
             }
