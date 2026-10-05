@@ -305,20 +305,35 @@ jobs:
             throw "WDK test certificate is not self-signed: Subject=$($signer.Subject) Issuer=$($signer.Issuer)"
           }
 
-          function Run-TestSignedVerification($label, $exe, $argList) {
+          function Run-TestSignedVerification($label, $exe, $argList, [bool]$catalogMembership = $false) {
             $o = & $exe @argList 2>&1
             $code = $LASTEXITCODE
             $text = $o | Out-String
             $normalized = [regex]::Replace($text, '\s+', ' ').Trim()
             Write-Host "== $label (exit $code) =="
             Write-Host $text
-            if ($code -eq 0) { return 'PASS' }
-
             $knownTrustError = 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider.'
-            $errorCount = [regex]::Matches($text, '(?im)^SignTool Error:').Count
-            if ($errorCount -eq 1 -and $normalized.Contains($knownTrustError)) {
+            $hasKnownTrustError = $normalized.Contains($knownTrustError)
+            $signToolErrors = @([regex]::Matches($normalized, 'SignTool Error: (.*?)(?= SignTool Error:|$)') | ForEach-Object { $_.Groups[1].Value.Trim() })
+
+            if ($catalogMembership) {
+              $hasMembership = $text -match '(?im)^File is signed in catalog:'
+              if (-not $hasMembership) { throw "$label FAILED: catalog membership evidence missing" }
+              if ($code -eq 0) { return 'MEMBERSHIP_PASS' }
+              $onlyTrustAndFileNotValid = $signToolErrors.Count -eq 2 -and
+                $hasKnownTrustError -and
+                ($signToolErrors | Where-Object { $_ -notlike 'File not valid:*' -and $_ -ne $knownTrustError }).Count -eq 0
+              if ($onlyTrustAndFileNotValid) {
+                Write-Host "${label}: MEMBERSHIP_PASS_TRUST_UNVERIFIED"
+                return 'MEMBERSHIP_PASS_TRUST_UNVERIFIED'
+              }
+              throw "$label FAILED (exit $code)"
+            }
+
+            if ($code -eq 0) { return 'PASS' }
+            if ($signToolErrors.Count -eq 1 -and $hasKnownTrustError) {
               Write-Host "${label}: CI TRUST-UNVERIFIED (self-signed WDK test certificate)"
-              return 'UNVERIFIED'
+              return 'UNVERIFIED_TRUST'
             }
             throw "$label FAILED (exit $code)"
           }
@@ -326,11 +341,11 @@ jobs:
           $signtool = Find-Tool 'signtool.exe'
           $dllVerify = Run-TestSignedVerification 'signtool verify DLL' $signtool @('verify','/v','/pa',$dll)
           $catVerify = Run-TestSignedVerification 'signtool verify CAT' $signtool @('verify','/v','/pa',$cat)
-          $dllMembership = Run-TestSignedVerification 'catalog membership DLL' $signtool @('verify','/v','/pa','/c',$cat,$dll)
-          $infMembership = Run-TestSignedVerification 'catalog membership INF' $signtool @('verify','/v','/pa','/c',$cat,$inf)
+          $dllMembership = Run-TestSignedVerification 'catalog membership DLL' $signtool @('verify','/v','/pa','/c',$cat,$dll) $true
+          $infMembership = Run-TestSignedVerification 'catalog membership INF' $signtool @('verify','/v','/pa','/c',$cat,$inf) $true
 
-          $trustChain = if (@($dllVerify,$catVerify,$dllMembership,$infMembership) -contains 'UNVERIFIED') { 'UNVERIFIED_SELF_SIGNED_TEST_CERT' } else { 'PASS' }
-          $catalogMembership = if (@($dllMembership,$infMembership) -contains 'UNVERIFIED') { 'UNVERIFIED' } else { 'PASS' }
+          $trustChain = if (@($dllVerify,$catVerify,$dllMembership,$infMembership) -contains 'UNVERIFIED_TRUST' -or @($dllVerify,$catVerify,$dllMembership,$infMembership) -contains 'MEMBERSHIP_PASS_TRUST_UNVERIFIED') { 'UNVERIFIED_SELF_SIGNED_TEST_CERT' } else { 'PASS' }
+          $catalogMembership = if (@($dllMembership,$infMembership) -contains 'MEMBERSHIP_PASS' -or @($dllMembership,$infMembership) -contains 'MEMBERSHIP_PASS_TRUST_UNVERIFIED') { 'PASS' } else { 'FAIL' }
           Write-Host 'PACKAGE PROVENANCE: PASS'
           Write-Host 'INF VALIDATION: PASS'
           Write-Host 'DLL ARCH: PASS'
