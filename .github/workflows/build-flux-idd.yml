@@ -203,6 +203,16 @@ jobs:
             Copy-Item -LiteralPath $src -Destination $dest -Force
           }
 
+          # Export the public test certificate so the guest can trust this exact build.
+          $sig = Get-AuthenticodeSignature -FilePath (Join-Path $dest 'FluxIdd.dll')
+          if (-not $sig.SignerCertificate) { throw 'FluxIdd.dll is not signed; cannot export test certificate.' }
+          $cerPath = Join-Path $dest 'FluxIddTestCert.cer'
+          [System.IO.File]::WriteAllBytes($cerPath, $sig.SignerCertificate.Export('Cert'))
+          $sig.SignerCertificate.Thumbprint | Set-Content -LiteralPath (Join-Path $dest 'FluxIddTestCert.thumbprint.txt') -Encoding ascii
+          Write-Host "Exported test certificate: $cerPath"
+          Write-Host "Test certificate thumbprint: $($sig.SignerCertificate.Thumbprint)"
+          Write-Host "Test certificate subject: $($sig.SignerCertificate.Subject)"
+
           $symDir = '.artifacts\FluxIdd\symbols'
           New-Item -ItemType Directory -Force -Path $symDir | Out-Null
           $pdb = Join-Path $pkg 'FluxIdd.pdb'
@@ -298,6 +308,11 @@ jobs:
           }
 
           $signer = $sDll.SignerCertificate
+          $cerFile = Join-Path $d 'FluxIddTestCert.cer'
+          if (-not (Test-Path -LiteralPath $cerFile)) { throw 'Exported test certificate (.cer) is missing from the package.' }
+          $exported = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new((Resolve-Path $cerFile).Path)
+          if ($exported.Thumbprint -ne $signer.Thumbprint) { throw "Exported .cer thumbprint $($exported.Thumbprint) does not match signer $($signer.Thumbprint)" }
+          Write-Host "Exported .cer matches package signer: $($exported.Thumbprint)"
           if ($signer.Subject -notmatch 'WDKTestCert') {
             throw "Unexpected package signer subject: $($signer.Subject)"
           }
