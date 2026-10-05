@@ -305,22 +305,23 @@ jobs:
             throw "WDK test certificate is not self-signed: Subject=$($signer.Subject) Issuer=$($signer.Issuer)"
           }
 
-          $rootStore = 'Cert:\CurrentUser\Root'
-          $tempCert = Join-Path $env:RUNNER_TEMP "FluxIdd-WDKTestCert-$($signer.Thumbprint).cer"
-          $existingRoot = @(Get-ChildItem -Path $rootStore | Where-Object { $_.Thumbprint -eq $signer.Thumbprint })
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            [System.Security.Cryptography.X509Certificates.StoreName]::Root,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
           $temporaryRootTrustAdded = $false
 
           try {
-            [System.IO.File]::WriteAllBytes(
-              $tempCert,
-              $signer.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $existingRoot = @($store.Certificates | Where-Object { $_.Thumbprint -eq $signer.Thumbprint })
 
             if ($existingRoot.Count -eq 0) {
-              Import-Certificate -FilePath $tempCert -CertStoreLocation $rootStore -ErrorAction Stop | Out-Null
+              Write-Host "X509Store Add starting UTC: $([DateTime]::UtcNow.ToString('o'))"
+              $store.Add($signer)
               $temporaryRootTrustAdded = $true
-              Write-Host "Temporarily trusted WDK test certificate in CurrentUser\\Root: $($signer.Thumbprint)"
+              Write-Host "X509Store Add completed UTC: $([DateTime]::UtcNow.ToString('o'))"
+              Write-Host "Temporarily trusted WDK test certificate via X509Store: $($signer.Thumbprint)"
             } else {
-              Write-Host "WDK test certificate already trusted in CurrentUser\\Root: $($signer.Thumbprint)"
+              Write-Host "WDK test certificate already trusted in CurrentUser Root: $($signer.Thumbprint)"
             }
 
             $signtool = Find-Tool 'signtool.exe'
@@ -330,10 +331,13 @@ jobs:
             Run-Strict 'catalog membership INF' $signtool @('verify','/v','/pa','/c',$cat,$inf)
           } finally {
             if ($temporaryRootTrustAdded) {
-              Remove-Item -LiteralPath (Join-Path $rootStore $signer.Thumbprint) -Force -ErrorAction Stop
-              Write-Host "Removed temporary WDK test certificate from CurrentUser\\Root: $($signer.Thumbprint)"
+              $toRemove = @($store.Certificates | Where-Object { $_.Thumbprint -eq $signer.Thumbprint })
+              foreach ($cert in $toRemove) {
+                $store.Remove($cert)
+              }
+              Write-Host "Removed temporary WDK test certificate via X509Store: $($signer.Thumbprint)"
             }
-            Remove-Item -LiteralPath $tempCert -Force -ErrorAction SilentlyContinue
+            $store.Close()
           }
 
           Write-Host 'PACKAGE COHERENCE: PASS'
