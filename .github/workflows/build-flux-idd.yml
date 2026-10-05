@@ -315,14 +315,34 @@ jobs:
             $knownTrustError = 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider.'
             $hasKnownTrustError = $normalized.Contains($knownTrustError)
             $signToolErrors = @([regex]::Matches($normalized, 'SignTool Error: (.*?)(?= SignTool Error:|$)') | ForEach-Object { $_.Groups[1].Value.Trim() })
+            Write-Host "DEBUG catalogMembership=$catalogMembership"
+            Write-Host "DEBUG code=$code"
+            Write-Host "DEBUG hasKnownTrustError=$hasKnownTrustError"
+            Write-Host "DEBUG signToolErrors.Count=$($signToolErrors.Count)"
+            for ($i = 0; $i -lt $signToolErrors.Count; $i++) {
+              Write-Host "DEBUG signToolErrors[$i]=<<<$($signToolErrors[$i])>>>"
+              Write-Host "DEBUG eqKnown[$i]=$($signToolErrors[$i] -eq $knownTrustError)"
+              Write-Host "DEBUG fileNotValid[$i]=$($signToolErrors[$i] -like 'File not valid:*')"
+            }
 
             if ($catalogMembership) {
               $hasMembership = $text -match '(?im)^File is signed in catalog:'
+              Write-Host "DEBUG hasMembership=$hasMembership"
+              $unexpected = @(
+                $signToolErrors | Where-Object {
+                  $_ -notlike 'File not valid:*' -and $_ -ne $knownTrustError
+                }
+              )
+              Write-Host "DEBUG unexpected.Count=$($unexpected.Count)"
+              for ($i = 0; $i -lt $unexpected.Count; $i++) {
+                Write-Host "DEBUG unexpected[$i]=<<<$($unexpected[$i])>>>"
+              }
               if (-not $hasMembership) { throw "$label FAILED: catalog membership evidence missing" }
               if ($code -eq 0) { return 'MEMBERSHIP_PASS' }
               $onlyTrustAndFileNotValid = $signToolErrors.Count -eq 2 -and
                 $hasKnownTrustError -and
                 ($signToolErrors | Where-Object { $_ -notlike 'File not valid:*' -and $_ -ne $knownTrustError }).Count -eq 0
+              Write-Host "DEBUG onlyTrustAndFileNotValid=$onlyTrustAndFileNotValid"
               if ($onlyTrustAndFileNotValid) {
                 Write-Host "${label}: MEMBERSHIP_PASS_TRUST_UNVERIFIED"
                 return 'MEMBERSHIP_PASS_TRUST_UNVERIFIED'
