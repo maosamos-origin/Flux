@@ -1,15 +1,18 @@
-; FluxIdd -- Windows 11 ARM64 UMDF IddCx package. Not installed by this milestone.
+; FluxIdd -- Windows 11 ARM64 UMDF IddCx package.
 [Version]
 Signature="$Windows NT$"
 Class=Display
 ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
+ClassVer=2.0
 Provider=%Flux%
 CatalogFile=FluxIdd.cat
 DriverVer=09/28/2026,0.1.0.0
 PnpLockDown=1
+
 [Manufacturer]
-%Flux%=FluxModels,NTarm64
-[FluxModels.NTarm64]
+%Flux%=FluxModels,NT$ARCH$.10.0...22000
+
+[FluxModels.NT$ARCH$.10.0...22000]
 %FluxIdd.DeviceDesc%=FluxIdd_Install,ROOT\FLUX_IDD
 [SourceDisksNames]
 1=%DiskName%,,,
