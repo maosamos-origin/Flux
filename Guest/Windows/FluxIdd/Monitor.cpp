@@ -11,23 +11,47 @@ static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* signal, const FluxId
 IDDCX_MONITOR_MODE FluxIddMakeMonitorMode(const FluxIddMode& mode) { IDDCX_MONITOR_MODE out = {}; out.Size = sizeof(out); out.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER; FillSignalInfo(&out.MonitorVideoSignalInfo, mode, true); return out; }
 IDDCX_TARGET_MODE FluxIddMakeTargetMode(const FluxIddMode& mode) { IDDCX_TARGET_MODE out = {}; out.Size = sizeof(out); FillSignalInfo(&out.TargetVideoSignalInfo.targetVideoSignalInfo, mode, false); return out; }
 NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
+    OutputDebugStringA("FluxIdd: FluxIddCreateAndArriveMonitor entered\n");
     WDF_OBJECT_ATTRIBUTES attributes; WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FluxMonitorContext);
     IDDCX_MONITOR_INFO monitorInfo = {}; monitorInfo.Size = sizeof(monitorInfo);
     monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER; monitorInfo.ConnectorIndex = 0;
     monitorInfo.MonitorDescription.Size = sizeof(monitorInfo.MonitorDescription);
     monitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_UNINITIALIZED;
     IDARG_IN_MONITORCREATE input = {}; input.ObjectAttributes = &attributes; input.pMonitorInfo = &monitorInfo;
-    IDARG_OUT_MONITORCREATE output = {}; NTSTATUS status = IddCxMonitorCreate(adapter, &input, &output); if (!NT_SUCCESS(status)) return status;
+    IDARG_OUT_MONITORCREATE output = {};
+    NTSTATUS status = IddCxMonitorCreate(adapter, &input, &output);
+    if (!NT_SUCCESS(status)) {
+        OutputDebugStringA("FluxIdd: IddCxMonitorCreate failed\n");
+        return status;
+    }
+    OutputDebugStringA("FluxIdd: IddCxMonitorCreate success\n");
     FluxGetMonitorContext(output.MonitorObject)->monitor = output.MonitorObject;
-    IDARG_OUT_MONITORARRIVAL arrival = {}; return IddCxMonitorArrival(output.MonitorObject, &arrival);
+    IDARG_OUT_MONITORARRIVAL arrival = {};
+    status = IddCxMonitorArrival(output.MonitorObject, &arrival);
+    if (!NT_SUCCESS(status)) {
+        OutputDebugStringA("FluxIdd: IddCxMonitorArrival failed\n");
+    } else {
+        OutputDebugStringA("FluxIdd: IddCxMonitorArrival success\n");
+    }
+    return status;
 }
 NTSTATUS FluxIddMonitorGetDefaultModes(IDDCX_MONITOR, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* input, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* output) {
+    OutputDebugStringA("FluxIdd: FluxIddMonitorGetDefaultModes entered\n");
     output->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(kFluxIddModeCount);
+    output->PreferredMonitorModeIdx = 0;
     if (input->DefaultMonitorModeBufferInputCount >= kFluxIddModeCount) for (size_t i = 0; i < kFluxIddModeCount; ++i) input->pDefaultMonitorModes[i] = FluxIddMakeMonitorMode(kFluxIddModes[i]);
     return STATUS_SUCCESS;
 }
 NTSTATUS FluxIddMonitorQueryTargetModes(IDDCX_MONITOR, const IDARG_IN_QUERYTARGETMODES* input, IDARG_OUT_QUERYTARGETMODES* output) {
+    OutputDebugStringA("FluxIdd: FluxIddMonitorQueryTargetModes entered\n");
     output->TargetModeBufferOutputCount = static_cast<UINT>(kFluxIddModeCount);
     if (input->TargetModeBufferInputCount >= kFluxIddModeCount) for (size_t i = 0; i < kFluxIddModeCount; ++i) input->pTargetModes[i] = FluxIddMakeTargetMode(kFluxIddModes[i]);
+    return STATUS_SUCCESS;
+}
+NTSTATUS FluxIddParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* input, IDARG_OUT_PARSEMONITORDESCRIPTION* output) {
+    OutputDebugStringA("FluxIdd: FluxIddParseMonitorDescription entered\n");
+    UNREFERENCED_PARAMETER(input);
+    output->MonitorModeBufferOutputCount = 0;
+    output->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
     return STATUS_SUCCESS;
 }
