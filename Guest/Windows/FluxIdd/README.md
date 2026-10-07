@@ -30,7 +30,7 @@ Run from a Windows Developer Command Prompt:
 msbuild .\FluxIdd.sln /m /p:Configuration=Debug /p:Platform=ARM64
 ```
 
-The ARM64 settings track Microsoft's current IddSample: UMDF 2.25 and IddCx 1.4. Verify installed WDK IddCx support before building.
+The ARM64 settings track Microsoft's current IddSample: UMDF 2.15 and IddCx 1.2 (aligned with Windows 11 24H2 IddCx0102). Verify installed WDK IddCx support before building.
 
 ## Signing later
 

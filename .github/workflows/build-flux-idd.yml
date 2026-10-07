@@ -295,7 +295,7 @@ jobs:
           if ($txt -notmatch '(?im)^\s*ClassGuid\s*=\s*\{4D36E968-E325-11CE-BFC1-08002BE10318\}\s*$') { throw 'INF: ClassGuid mismatch' }
           if ($txt -notmatch '(?im)^\s*ClassVer\s*=\s*2\.0\s*$') { throw 'INF: ClassVer=2.0 missing' }
           if ($txt -notmatch 'ROOT\\FLUX_IDD') { throw 'INF: ROOT\FLUX_IDD missing' }
-          if ($txt -notmatch '(?im)^\s*UmdfLibraryVersion\s*=\s*2\.25\.0\s*$') { throw 'INF: UmdfLibraryVersion=2.25.0 missing' }
+          if ($txt -notmatch '(?im)^\s*UmdfLibraryVersion\s*=\s*2\.15\.0\s*$') { throw 'INF: UmdfLibraryVersion=2.15.0 missing' }
           if ($txt.Contains('$UMDFVERSION$')) { throw 'INF still contains $UMDFVERSION$ (unstamped)' }
           if ($txt.Contains('$ARCH$')) { throw 'INF still contains $ARCH$ (unstamped)' }
           if ($txt -notmatch 'NTarm64\.10\.0\.\.\.22000') { throw 'INF: NTarm64.10.0...22000 target missing' }
