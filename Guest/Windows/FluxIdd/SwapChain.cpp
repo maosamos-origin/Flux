@@ -1,11 +1,18 @@
 #include "FluxIdd.h"
-NTSTATUS FluxIddMonitorAssignSwapChain(IDDCX_MONITOR, const IDARG_IN_SETSWAPCHAIN* args) {
+NTSTATUS FluxIddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN* args) {
     OutputDebugStringA("FluxIdd: FluxIddMonitorAssignSwapChain entered\n");
-    // Future implementation: IddCx frame -> Flux transport -> shared surface -> Metal.
-    // This build-only skeleton deliberately declines a scanout it cannot consume.
-    WdfObjectDelete(args->hSwapChain); return STATUS_SUCCESS;
+    auto* ctx = FluxGetMonitorContext(monitor);
+    if (ctx) {
+        ctx->swapChain = args->hSwapChain;
+    }
+    return STATUS_SUCCESS;
 }
-NTSTATUS FluxIddMonitorUnassignSwapChain(IDDCX_MONITOR) {
+NTSTATUS FluxIddMonitorUnassignSwapChain(IDDCX_MONITOR monitor) {
     OutputDebugStringA("FluxIdd: FluxIddMonitorUnassignSwapChain entered\n");
+    auto* ctx = FluxGetMonitorContext(monitor);
+    if (ctx && ctx->swapChain) {
+        WdfObjectDelete(ctx->swapChain);
+        ctx->swapChain = nullptr;
+    }
     return STATUS_SUCCESS;
 }

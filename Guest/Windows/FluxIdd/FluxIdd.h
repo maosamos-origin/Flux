@@ -14,7 +14,7 @@ constexpr size_t kFluxIddModeCount = 2;
 
 struct FluxDeviceContext final { WDFDEVICE device; IDDCX_ADAPTER adapter; };
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FluxDeviceContext, FluxGetDeviceContext);
-struct FluxMonitorContext final { IDDCX_MONITOR monitor; };
+struct FluxMonitorContext final { IDDCX_MONITOR monitor; IDDCX_SWAPCHAIN swapChain; };
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FluxMonitorContext, FluxGetMonitorContext);
 
 extern "C" DRIVER_INITIALIZE DriverEntry;

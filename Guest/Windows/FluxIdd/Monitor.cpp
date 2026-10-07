@@ -14,9 +14,15 @@ NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
     OutputDebugStringA("FluxIdd: FluxIddCreateAndArriveMonitor entered\n");
     WDF_OBJECT_ATTRIBUTES attributes; WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FluxMonitorContext);
     IDDCX_MONITOR_INFO monitorInfo = {}; monitorInfo.Size = sizeof(monitorInfo);
-    monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER; monitorInfo.ConnectorIndex = 0;
+    monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+    monitorInfo.ConnectorIndex = 0;
     monitorInfo.MonitorDescription.Size = sizeof(monitorInfo.MonitorDescription);
-    monitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_UNINITIALIZED;
+    monitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+    monitorInfo.MonitorDescription.DataSize = 0;
+    monitorInfo.MonitorDescription.pData = nullptr;
+    static const GUID kFluxMonitorContainerId = { 0x9b34a9e2, 0x7d7a, 0x4d3b, { 0x96, 0x42, 0x1c, 0x2d, 0xf3, 0x2a, 0xa0, 0x01 } };
+    monitorInfo.MonitorContainerId = kFluxMonitorContainerId;
+
     IDARG_IN_MONITORCREATE input = {}; input.ObjectAttributes = &attributes; input.pMonitorInfo = &monitorInfo;
     IDARG_OUT_MONITORCREATE output = {};
     NTSTATUS status = IddCxMonitorCreate(adapter, &input, &output);
@@ -25,7 +31,9 @@ NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
         return status;
     }
     OutputDebugStringA("FluxIdd: IddCxMonitorCreate success\n");
-    FluxGetMonitorContext(output.MonitorObject)->monitor = output.MonitorObject;
+    auto* monCtx = FluxGetMonitorContext(output.MonitorObject);
+    monCtx->monitor = output.MonitorObject;
+    monCtx->swapChain = nullptr;
     IDARG_OUT_MONITORARRIVAL arrival = {};
     status = IddCxMonitorArrival(output.MonitorObject, &arrival);
     if (!NT_SUCCESS(status)) {
