@@ -523,6 +523,7 @@ VOID WINAPI SwDeviceCreationCallback(
 bool RemoveDeviceInstance(const wchar_t* instanceId);
 
 bool CreateSoftwareDevice(const wchar_t* wantedHardwareId, const GUID& classGuid) {
+    (void)classGuid;
     // 1. Guardrail duplicate check
     DeviceMatch existing[16];
     DWORD existingCount = 0;
@@ -743,6 +744,7 @@ bool RemoveDeviceInstance(const wchar_t* instanceId) {
 }
 
 bool RunDaemon(const wchar_t* wantedHardwareId, const GUID& classGuid, DWORD durationSeconds) {
+    (void)classGuid;
     // 1. Single-instance mutex
     HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"Local\\FluxDevNodeDaemonMutex");
     if (!hMutex) {
