@@ -10,6 +10,7 @@
 #pragma comment(lib, "swdevice.lib")
 #else
 typedef void* HANDLE;
+typedef void* HMODULE;
 typedef void* HDEVINFO;
 typedef unsigned long DWORD;
 typedef unsigned long ULONG;
@@ -91,9 +92,9 @@ typedef struct _SW_DEVICE_CREATE_INFO {
 } SW_DEVICE_CREATE_INFO, *PSW_DEVICE_CREATE_INFO;
 
 typedef enum _SW_DEVICE_LIFETIME {
-    SwDeviceLifetimeHandle = 0,
-    SwDeviceLifetimeParentPresent = 1,
-    SwDeviceLifetimeMax = 2
+    SWDeviceLifetimeHandle = 0,
+    SWDeviceLifetimeParentPresent = 1,
+    SWDeviceLifetimeMax = 2
 } SW_DEVICE_LIFETIME;
 
 typedef VOID (WINAPI *SW_DEVICE_CREATE_CALLBACK)(
@@ -152,9 +153,9 @@ extern "C" {
     DWORD __stdcall WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
     VOID __stdcall Sleep(DWORD dwMilliseconds);
     BOOL __stdcall CloseHandle(HANDLE hObject);
-    HANDLE __stdcall LoadLibraryW(PCWSTR lpLibFileName);
-    void* __stdcall GetProcAddress(HANDLE hModule, const char* lpProcName);
-    BOOL __stdcall FreeLibrary(HANDLE hLibModule);
+    HMODULE __stdcall LoadLibraryW(PCWSTR lpLibFileName);
+    void* __stdcall GetProcAddress(HMODULE hModule, const char* lpProcName);
+    BOOL __stdcall FreeLibrary(HMODULE hLibModule);
 
     HDEVINFO __stdcall SetupDiGetClassDevsW(const GUID* ClassGuid, PCWSTR Enumerator, HANDLE hwndParent, DWORD Flags);
     BOOL __stdcall SetupDiEnumDeviceInfo(HDEVINFO DeviceInfoSet, DWORD MemberIndex, PSP_DEVINFO_DATA DeviceInfoData);
@@ -166,7 +167,7 @@ extern "C" {
     BOOL __stdcall SetupDiOpenDeviceInfoW(HDEVINFO DeviceInfoSet, PCWSTR DeviceInstanceId, HANDLE hwndParent, DWORD OpenFlags, PSP_DEVINFO_DATA DeviceInfoData);
     BOOL __stdcall SetupDiCallClassInstaller(DWORD InstallFunction, HDEVINFO DeviceInfoSet, PSP_DEVINFO_DATA DeviceInfoData);
 
-    int __stdcall StringFromGUID2(const GUID* rguid, wchar_t* lpsz, int cchMax);
+    int __stdcall StringFromGUID2(const GUID& rguid, wchar_t* lpsz, int cchMax);
     HRESULT __stdcall CLSIDFromString(PCWSTR lpsz, GUID* pclsid);
     wchar_t** __stdcall CommandLineToArgvW(PCWSTR lpCmdLine, int* pNumArgs);
     PCWSTR __stdcall GetCommandLineW(VOID);
@@ -286,7 +287,7 @@ void OutHex(const wchar_t* prefix, DWORD val) {
     buf[pos++] = L'0'; buf[pos++] = L'x';
     for (int i = 7; i >= 0; i--) {
         unsigned int nib = (val >> (i * 4)) & 0xF;
-        buf[pos++] = (nib < 10) ? (L'0' + nib) : (L'A' + nib - 10);
+        buf[pos++] = static_cast<wchar_t>((nib < 10) ? (L'0' + nib) : (L'A' + nib - 10));
     }
     buf[pos++] = L'\r'; buf[pos++] = L'\n'; buf[pos] = L'\0';
     Out(buf);
@@ -301,7 +302,7 @@ void OutDec(const wchar_t* prefix, DWORD val) {
     if (val == 0) num[ni++] = L'0';
     else {
         DWORD t = val;
-        while (t > 0) { num[ni++] = L'0' + (t % 10); t /= 10; }
+        while (t > 0) { num[ni++] = static_cast<wchar_t>(L'0' + (t % 10)); t /= 10; }
     }
     for (int i = ni - 1; i >= 0; i--) buf[pos++] = num[i];
     buf[pos++] = L'\r'; buf[pos++] = L'\n'; buf[pos] = L'\0';
@@ -312,8 +313,8 @@ int StrICmp(const wchar_t* s1, const wchar_t* s2) {
     while (*s1 && *s2) {
         wchar_t c1 = *s1;
         wchar_t c2 = *s2;
-        if (c1 >= L'A' && c1 <= L'Z') c1 += (L'a' - L'A');
-        if (c2 >= L'A' && c2 <= L'Z') c2 += (L'a' - L'A');
+        if (c1 >= L'A' && c1 <= L'Z') c1 = static_cast<wchar_t>(c1 + (L'a' - L'A'));
+        if (c2 >= L'A' && c2 <= L'Z') c2 = static_cast<wchar_t>(c2 + (L'a' - L'A'));
         if (c1 != c2) return (int)(c1 - c2);
         s1++; s2++;
     }
@@ -474,7 +475,7 @@ bool QueryHardwareId(const wchar_t* hardwareId) {
         Out(L"HARDWARE_ID="); OutLine(hardwareId);
 
         wchar_t g[64] = {};
-        StringFromGUID2(&d.ClassGuid, g, 64);
+        StringFromGUID2(d.ClassGuid, g, 64);
         Out(L"CLASS_GUID="); OutLine(g);
 
         wchar_t cname[256] = {};
@@ -554,7 +555,7 @@ bool CreateSoftwareDevice(const wchar_t* wantedHardwareId, const GUID& classGuid
     OutLine(L"ALREADY_EXISTS=NO");
 
     // 2. Resolve SwDevice and ConfigMgr APIs (cfgmgr32.dll with swdevice.dll fallback)
-    HANDLE hCfgMgr = LoadLibraryW(L"cfgmgr32.dll");
+    HMODULE hCfgMgr = LoadLibraryW(L"cfgmgr32.dll");
     if (!hCfgMgr) hCfgMgr = LoadLibraryW(L"swdevice.dll");
     if (!hCfgMgr) {
         PrintWin32Failure(L"LoadLibrary(cfgmgr32.dll)", GetLastError());
@@ -699,8 +700,8 @@ bool CreateSoftwareDevice(const wchar_t* wantedHardwareId, const GUID& classGuid
     OutLine(L"SWD_CREATION=PASS");
     Out(L"SWD_INSTANCE_ID="); OutLine(ctx.instanceId);
 
-    // 7. Establish Persistent Lifetime (SwDeviceLifetimeParentPresent)
-    HRESULT hrLifetime = pfnSwDeviceSetLifetime(hSwDevice, SwDeviceLifetimeParentPresent);
+    // 7. Establish Persistent Lifetime (SWDeviceLifetimeParentPresent)
+    HRESULT hrLifetime = pfnSwDeviceSetLifetime(hSwDevice, SWDeviceLifetimeParentPresent);
     if (SUCCEEDED(hrLifetime)) {
         OutLine(L"SWDEVICE_LIFETIME_MODEL=SwDeviceLifetimeParentPresent");
         OutLine(L"PERSISTENT_ACROSS_PROCESS_EXIT=YES");
@@ -795,7 +796,7 @@ bool RunDaemon(const wchar_t* wantedHardwareId, const GUID& classGuid, DWORD dur
     }
 
     // 4. Resolve SwDevice APIs
-    HANDLE hCfgMgr = LoadLibraryW(L"cfgmgr32.dll");
+    HMODULE hCfgMgr = LoadLibraryW(L"cfgmgr32.dll");
     if (!hCfgMgr) hCfgMgr = LoadLibraryW(L"swdevice.dll");
     if (!hCfgMgr) {
         PrintWin32Failure(L"LoadLibrary(cfgmgr32.dll)", GetLastError());
