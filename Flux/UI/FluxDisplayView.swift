@@ -29,6 +29,14 @@ struct FluxDisplayView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MTKView, context: Context) {
+        if let window = nsView.window, window.isKeyWindow, window.firstResponder !== nsView {
+            DispatchQueue.main.async { [weak nsView, weak window] in
+                guard let nsView = nsView, let window = window, window.isKeyWindow else { return }
+                if window.firstResponder !== nsView {
+                    window.makeFirstResponder(nsView)
+                }
+            }
+        }
     }
 
     final class Coordinator {
@@ -37,9 +45,15 @@ struct FluxDisplayView: NSViewRepresentable {
 }
 
 /// Native USB HID Boot Keyboard, Absolute Pointer, and diagnostic serial-console input view.
-private final class FluxDiagnosticDisplayView: MTKView {
+internal final class FluxDiagnosticDisplayView: MTKView {
+    static weak var current: FluxDiagnosticDisplayView?
+
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
 
     private var trackingArea: NSTrackingArea?
 
@@ -75,13 +89,29 @@ private final class FluxDiagnosticDisplayView: MTKView {
         super.viewDidMoveToWindow()
         NotificationCenter.default.removeObserver(self)
         if let window = self.window {
+            Self.current = self
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidResignKey), name: NSWindow.didResignKeyNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey), name: NSWindow.didBecomeKeyNotification, object: window)
-            NotificationCenter.default.addObserver(self, selector: #selector(windowDidResignKey), name: NSApplication.didResignActiveNotification, object: nil)
-            NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey), name: NSApplication.didBecomeActiveNotification, object: nil)
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidChangeFullScreen), name: NSWindow.didEnterFullScreenNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidChangeFullScreen), name: NSWindow.didExitFullScreenNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidResize), name: NSWindow.didResizeNotification, object: window)
+
+            if window.isKeyWindow {
+                claimFirstResponder()
+            }
+            setupKeyEventMonitor()
+        } else {
+            if Self.current === self {
+                Self.current = nil
+            }
+            teardownKeyEventMonitor()
+        }
+    }
+
+    deinit {
+        teardownKeyEventMonitor()
+        if Self.current === self {
+            Self.current = nil
         }
     }
 
@@ -108,15 +138,26 @@ private final class FluxDiagnosticDisplayView: MTKView {
     }
 
     @objc private func windowDidResignKey() {
+        print("🪟 [WINDOW-STATE] windowDidResignKey: isKey=\(window?.isKeyWindow ?? false) isMain=\(window?.isMainWindow ?? false) appActive=\(NSApp.isActive)")
         scrollAccumulator = 0.0
         FluxHIDKeyboard.shared.resetState()
         FluxHIDPointer.shared.resetButtons()
     }
 
     @objc private func windowDidBecomeKey() {
-        window?.makeFirstResponder(self)
+        print("🪟 [WINDOW-STATE] windowDidBecomeKey: isKey=\(window?.isKeyWindow ?? false) isMain=\(window?.isMainWindow ?? false) appActive=\(NSApp.isActive) keyWin=\(NSApp.keyWindow != nil)")
+        claimFirstResponder()
         let flags = NSEvent.modifierFlags.rawValue
         FluxHIDKeyboard.shared.handleFlagsChanged(keyCode: 0, rawFlags: flags)
+    }
+
+    private func claimFirstResponder() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let window = self.window, window.isKeyWindow else { return }
+            if window.firstResponder !== self {
+                window.makeFirstResponder(self)
+            }
+        }
     }
 
     @objc private func windowDidChangeFullScreen() {
@@ -214,10 +255,49 @@ private final class FluxDiagnosticDisplayView: MTKView {
         }
     }
 
-    override func keyDown(with event: NSEvent) {
-        guard let window = self.window, window.isKeyWindow, window.firstResponder === self else { return }
+    // MARK: - Native Keyboard Fallback Monitor
 
+    private var keyEventMonitor: Any?
+
+    private func setupKeyEventMonitor() {
+        guard keyEventMonitor == nil else { return }
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+            FluxHIDKeyboard.appendKeyboardTrace("[LOCAL-KEY-MONITOR-PRE-GATE] type=\(event.type) keyCode=\(event.keyCode) modifierFlags=\(event.modifierFlags.rawValue) eventWindowNumber=\(event.windowNumber) eventWindowTitle=\(event.window?.title ?? "nil") appActive=\(NSApp.isActive) keyWindowTitle=\(NSApp.keyWindow?.title ?? "nil") mainWindowTitle=\(NSApp.mainWindow?.title ?? "nil") fluxWindowNumber=\(self?.window?.windowNumber.description ?? "nil") fluxIsKeyWindow=\(self?.window?.isKeyWindow.description ?? "nil") fluxIsMainWindow=\(self?.window?.isMainWindow.description ?? "nil") firstResponder=\(String(describing: self?.window?.firstResponder)))")
+            guard let self = self,
+                  let window = self.window,
+                  window.isKeyWindow,
+                  (event.window === window || (event.window == nil && NSApp.keyWindow === window)),
+                  window.firstResponder !== self
+            else {
+                return event
+            }
+
+            switch event.type {
+            case .keyDown:
+                self.processKeyDown(event)
+                return nil
+            case .keyUp:
+                self.processKeyUp(event)
+                return nil
+            case .flagsChanged:
+                self.processFlagsChanged(event)
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func teardownKeyEventMonitor() {
+        if let monitor = keyEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyEventMonitor = nil
+        }
+    }
+
+    private func processKeyDown(_ event: NSEvent) {
         // Route to USB HID Boot Keyboard
+        FluxHIDKeyboard.appendKeyboardTrace("[DISPLAY-KEYDOWN] keyCode=\(event.keyCode) isRepeat=\(event.isARepeat)")
         FluxHIDKeyboard.shared.handleKeyDown(keyCode: event.keyCode, isRepeat: event.isARepeat)
 
         // Preserve temporary diagnostic UART forwarding
@@ -239,13 +319,27 @@ private final class FluxDiagnosticDisplayView: MTKView {
         FluxUART.injectDiagnosticInput(bytes)
     }
 
+    private func processKeyUp(_ event: NSEvent) {
+        FluxHIDKeyboard.appendKeyboardTrace("[DISPLAY-KEYUP] keyCode=\(event.keyCode)")
+        FluxHIDKeyboard.shared.handleKeyUp(keyCode: event.keyCode)
+    }
+
+    private func processFlagsChanged(_ event: NSEvent) {
+        FluxHIDKeyboard.shared.handleFlagsChanged(keyCode: event.keyCode, rawFlags: event.modifierFlags.rawValue)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let window = self.window, window.isKeyWindow, window.firstResponder === self else { return }
+        processKeyDown(event)
+    }
+
     override func keyUp(with event: NSEvent) {
         guard let window = self.window, window.isKeyWindow, window.firstResponder === self else { return }
-        FluxHIDKeyboard.shared.handleKeyUp(keyCode: event.keyCode)
+        processKeyUp(event)
     }
 
     override func flagsChanged(with event: NSEvent) {
         guard let window = self.window, window.isKeyWindow, window.firstResponder === self else { return }
-        FluxHIDKeyboard.shared.handleFlagsChanged(keyCode: event.keyCode, rawFlags: event.modifierFlags.rawValue)
+        processFlagsChanged(event)
     }
 }

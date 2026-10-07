@@ -13,6 +13,7 @@ import CryptoKit
 /// - Byte 5: Vertical Wheel (Int8 Little-Endian, -127...+127)
 nonisolated final class FluxHIDPointer {
     static let shared = FluxHIDPointer()
+    private static let uacPointerTraceLock = NSLock()
 
     private let lock = NSLock()
     private var buttons: UInt8 = 0
@@ -21,6 +22,33 @@ nonisolated final class FluxHIDPointer {
     private var reportQueue: [[UInt8]] = []
 
     private init() {}
+
+    /// Test-only durable trace for correlating delivered EP5 pointer reports
+    /// with a UAC secure-desktop transition. It is gated so normal pointer
+    /// behavior and report ordering remain untouched.
+    static func appendUACPointerTrace(_ report: [UInt8]) {
+        guard ProcessInfo.processInfo.environment["FLUX_UAC_POINTER_TRACE"] == "1",
+              report.count >= 5 else { return }
+
+        let buttons = report[0] & 0x07
+        let x = UInt16(report[1]) | (UInt16(report[2]) << 8)
+        let y = UInt16(report[3]) | (UInt16(report[4]) << 8)
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[UAC-POINTER-TRACE] timestamp=\(timestamp) buttons=\(buttons) x=\(x) y=\(y)\n"
+        let path = FluxVM.defaultAppDirectory() + "/uac-pointer-trace.log"
+
+        uacPointerTraceLock.lock()
+        defer { uacPointerTraceLock.unlock() }
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        guard let data = line.data(using: .utf8),
+              let handle = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write(data)
+        handle.synchronizeFile()
+    }
 
     // MARK: - State Updates
 

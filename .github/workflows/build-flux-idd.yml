@@ -16,7 +16,7 @@ on:
 jobs:
   build-arm64:
     name: Build ARM64 UMDF IddCx package
-    runs-on: windows-2025
+    runs-on: windows-2022
     defaults:
       run:
         shell: pwsh
@@ -40,11 +40,23 @@ jobs:
           "VS_INSTALL_PATH=$vsInstallPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ARM64_MSVC_COMPONENT=$arm64Component" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install Windows 11 26H1 SDK and WDK for VS18 IddCx
+      - name: Install Windows 11 24H2 SDK and WDK for VS17 IddCx
         run: |
           $ErrorActionPreference = 'Stop'
-          winget install --exact --id Microsoft.WindowsSDK.10.0.28000 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
-          winget install --exact --id Microsoft.WindowsWDK.10.0.28000 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+          $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0"
+          if (-not (Test-Path $sdkPath)) {
+            Write-Host "Installing Microsoft.WindowsSDK.10.0.26100..."
+            winget install --exact --id Microsoft.WindowsSDK.10.0.26100 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+          } else {
+            Write-Host "Windows SDK 10.0.26100.0 already present at $sdkPath"
+          }
+          $wdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.26100.0"
+          if (-not (Test-Path $wdkPath)) {
+            Write-Host "Installing Microsoft.WindowsWDK.10.0.26100..."
+            winget install --exact --id Microsoft.WindowsWDK.10.0.26100 --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+          } else {
+            Write-Host "Windows WDK 10.0.26100.0 already present at $wdkPath"
+          }
 
       - name: Install MSVC ARM64 cross tools
         run: |
@@ -87,27 +99,30 @@ jobs:
           $iddcxHeader = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter iddcx.h -ErrorAction SilentlyContinue | Select-Object -First 1
           $iddcxLib = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter IddCxStub.lib -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '\\arm64\\' } | Select-Object -First 1
-          $driverKitTasks = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Recurse -Filter Microsoft.DriverKit.Build.Tasks.18.0.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          $driverKitTasks = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Recurse -Filter Microsoft.DriverKit.Build.Tasks.17.0.dll -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $iddcxHeader) { throw 'iddcx.h was not found in the installed SDK/WDK.' }
           if (-not $iddcxLib) { throw 'ARM64 IddCxStub.lib was not found in the installed SDK/WDK.' }
-          if (-not $driverKitTasks) { throw 'Microsoft.DriverKit.Build.Tasks.18.0.dll was not found in the installed WDK.' }
+          if (-not $driverKitTasks) { throw 'Microsoft.DriverKit.Build.Tasks.17.0.dll was not found in the installed WDK.' }
           "IDDCX_HEADER=$($iddcxHeader.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "IDDCX_LIB=$($iddcxLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "DRIVERKIT_TASKS_18=$($driverKitTasks.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DRIVERKIT_TASKS_17=$($driverKitTasks.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "iddcx.h: $($iddcxHeader.FullName)"
           Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
-          $wdkBuildRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.28000.0"
-          $wdkToolsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.28000.0"
+          $wdkBuildRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.26100.0"
+          $wdkToolsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.26100.0"
           $infVerifExe = "$wdkToolsRoot\x64\infverif.exe"
+          if (-not (Test-Path $infVerifExe)) {
+            $infVerifExe = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter infverif.exe | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1).FullName
+          }
           $infVerifDll = "$wdkBuildRoot\bin\x64\infverif.dll"
           $infVerifHlkDll = "$wdkBuildRoot\bin\x64\infverifhlk.dll"
-          $packageVerifierTasks = "$wdkBuildRoot\bin\Microsoft.DriverKit.Build.Tasks.PackageVerifier.18.0.dll"
+          $packageVerifierTasks = "$wdkBuildRoot\bin\Microsoft.DriverKit.Build.Tasks.PackageVerifier.17.0.dll"
           @($infVerifExe,$infVerifDll,$infVerifHlkDll,$driverKitTasks.FullName,$packageVerifierTasks) | ForEach-Object { if (-not (Test-Path $_)) { throw "Required WDK runtime file was not found: $_" } }
           Write-Host "x64 InfVerif.exe: $infVerifExe"
           Write-Host "x64 InfVerif.dll: $infVerifDll"
           Write-Host "x64 InfVerifHLK.dll: $infVerifHlkDll"
-          Write-Host "DriverKit Build Tasks 18: $($driverKitTasks.FullName)"
-          Write-Host "PackageVerifier Tasks 18: $packageVerifierTasks"
+          Write-Host "DriverKit Build Tasks 17: $($driverKitTasks.FullName)"
+          Write-Host "PackageVerifier Tasks 17: $packageVerifierTasks"
           $commonTargets = Join-Path (Split-Path (Split-Path $driverKitTasks.FullName -Parent) -Parent) 'WindowsDriver.common.targets'
           if (-not (Test-Path $commonTargets)) { throw "WindowsDriver.common.targets was not found: $commonTargets" }
           $taskAssemblyDirectory = Split-Path $driverKitTasks.FullName -Parent
@@ -122,7 +137,7 @@ jobs:
           (Get-Content $commonTargets | Select-Object -Skip 679 -First 41) | ForEach-Object { Write-Host $_ }
           Write-Host '=== All InfVerif references in WindowsDriver.common.targets ==='
           Select-String -Path $commonTargets -Pattern 'InfVerif|InfVerif.dll|RunInfVerif' | ForEach-Object { Write-Host "line $($_.LineNumber): $($_.Line.Trim())" }
-          $validateUsingTask = Select-String -Path $commonTargets -Pattern 'ValidateNTTargetVersion|Microsoft.DriverKit.Build.Tasks.18.0.dll' | Select-Object -First 1
+          $validateUsingTask = Select-String -Path $commonTargets -Pattern 'ValidateNTTargetVersion|Microsoft.DriverKit.Build.Tasks.17.0.dll' | Select-Object -First 1
           if (-not $validateUsingTask) { throw "ValidateNTTargetVersion UsingTask declaration was not found: $commonTargets" }
           Write-Host "ValidateNTTargetVersion UsingTask: $($validateUsingTask.Line.Trim())"
           $arm64Compiler = Get-ChildItem "$env:VS_INSTALL_PATH\VC\Tools\MSVC" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue |
@@ -171,8 +186,12 @@ jobs:
           Write-Host "Selected dumpbin.exe: $($dumpbin.FullName)"
           & $dumpbin.FullName /headers $dll.FullName 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\dumpbin-headers.log
           if (-not ((Get-Content .artifacts\FluxIdd\dumpbin-headers.log -Raw) -match 'ARM64')) { throw 'FluxIdd.dll is not ARM64.' }
-          $infVerif = Join-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.28000.0\x64" 'infverif.exe'
-          if (-not (Test-Path $infVerif)) { throw "x64 InfVerif.exe was not found: $infVerif" }
+          $infVerif = Join-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Tools\10.0.26100.0\x64" 'infverif.exe'
+          if (-not (Test-Path $infVerif)) {
+            $infVerif = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter infverif.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\infverif\.exe$' } | Select-Object -First 1).FullName
+          }
+          if (-not $infVerif -or -not (Test-Path $infVerif)) { throw "x64 InfVerif.exe was not found: $infVerif" }
           Write-Host "Selected InfVerif.exe: $infVerif"
           & $infVerif /v $stampedInf 2>&1 | Tee-Object -FilePath .artifacts\FluxIdd\infverif.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

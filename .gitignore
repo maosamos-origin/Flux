@@ -51,3 +51,4 @@ Guest/Windows/FluxIdd/**/*.tlog/
 *.key
 *.cer
 *.crt
+recovery-evidence/

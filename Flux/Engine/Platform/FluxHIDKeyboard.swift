@@ -6,6 +6,21 @@ import AppKit
 nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
 
     static let shared = FluxHIDKeyboard()
+    private static let diagnosticTraceLock = NSLock()
+
+    static func appendKeyboardTrace(_ line: String) {
+        diagnosticTraceLock.lock()
+        defer { diagnosticTraceLock.unlock() }
+        let path = FluxVM.defaultAppDirectory() + "/local-key-monitor.log"
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: path), let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            handle.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
+    }
 
     private let lock = NSLock()
     private var pressedKeys: [UInt8] = []  // Up to 6 simultaneous HID usage codes
@@ -13,6 +28,44 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
     private var reportQueue: [[UInt8]] = [] // Enqueued 8-byte reports waiting for EP3 transfer
 
     private init() {}
+
+    // MARK: - Test-only Win+R automation trace
+
+    /// Records only the explicit synthetic key transitions used by the isolated
+    /// Win+R control. Normal physical keyboard delivery never calls this path.
+    private func appendAutoKeyTrace(action: String, keyCode: UInt16, usage: UInt8?, report: [UInt8]) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let usageText = usage.map { String(format: "0x%02X", $0) } ?? "modifier"
+        let bytes = report.map { String(format: "%02x", $0) }.joined(separator: " ")
+        let line = "[AUTO-KEY] timestamp=\(timestamp) action=\(action) keyCode=\(keyCode) usage=\(usageText) report=[\(bytes)]"
+        print(line)
+        Self.appendKeyboardTrace(line)
+    }
+
+    private func currentReportSnapshot() -> [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        var report: [UInt8] = [modifiers, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        for i in 0..<min(pressedKeys.count, 6) {
+            report[2 + i] = pressedKeys[i]
+        }
+        return report
+    }
+
+    private func sendAutoKeyDown(_ keyCode: UInt16) {
+        handleKeyDown(keyCode: keyCode, isRepeat: false)
+        appendAutoKeyTrace(action: "DOWN", keyCode: keyCode, usage: Self.hidUsage(for: keyCode), report: currentReportSnapshot())
+    }
+
+    private func sendAutoKeyUp(_ keyCode: UInt16) {
+        handleKeyUp(keyCode: keyCode)
+        appendAutoKeyTrace(action: "UP", keyCode: keyCode, usage: Self.hidUsage(for: keyCode), report: currentReportSnapshot())
+    }
+
+    private func sendAutoFlagsChanged(_ keyCode: UInt16, rawFlags: UInt, action: String) {
+        handleFlagsChanged(keyCode: keyCode, rawFlags: rawFlags)
+        appendAutoKeyTrace(action: action, keyCode: keyCode, usage: nil, report: currentReportSnapshot())
+    }
 
     // MARK: - KeyCode -> HID Usage Mapping
 
@@ -94,6 +147,8 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
     // MARK: - Event Ingestion
 
     func handleKeyDown(keyCode: UInt16, isRepeat: Bool) {
+        let mappedUsage = Self.hidUsage(for: keyCode)
+        Self.appendKeyboardTrace("[HID-KEYBOARD-DOWN] keyCode=\(keyCode) mappedUsage=\(mappedUsage.map { String(format: "0x%02X", $0) } ?? "nil")")
         var enqueued = false
         var reportBytes: [UInt8] = []
         var hidUsage: UInt8?
@@ -121,6 +176,8 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
     }
 
     func handleKeyUp(keyCode: UInt16) {
+        let mappedUsage = Self.hidUsage(for: keyCode)
+        Self.appendKeyboardTrace("[HID-KEYBOARD-UP] keyCode=\(keyCode) mappedUsage=\(mappedUsage.map { String(format: "0x%02X", $0) } ?? "nil")")
         var enqueued = false
         var reportBytes: [UInt8] = []
         var hidUsage: UInt8?
@@ -278,19 +335,142 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
 
     private var testStarted = false
 
+    func scheduleTestFromLaunchIfNeeded() {
+        let launchTimestamp = ISO8601DateFormatter().string(from: Date())
+        let tpCertutilTest = ProcessInfo.processInfo.environment["FLUX_TEST_TP_CERTUTIL"] == "1"
+        let signingPolicyAuditTest = ProcessInfo.processInfo.environment["FLUX_TEST_SIGNING_AUDIT"] == "1"
+        let launcherFlagValue = ProcessInfo.processInfo.environment["FLUX_TEST_SIGNING_LAUNCHER"]
+        let signingPolicyLauncherTest = ProcessInfo.processInfo.environment["FLUX_TEST_SIGNING_LAUNCHER"] == "1"
+        let devNodeCreateTest = ProcessInfo.processInfo.environment["FLUX_TEST_DEVNODE_CREATE"] == "1"
+#if DEBUG
+        let finishInstallTest = ProcessInfo.processInfo.environment["FLUX_TEST_FINISH_INSTALL"] == "1"
+        let rebootVerifyTest = ProcessInfo.processInfo.environment["FLUX_TEST_REBOOT_VERIFY"] == "1"
+        let pnpRestartTest = ProcessInfo.processInfo.environment["FLUX_TEST_PNP_RESTART"] == "1"
+        let swdMigrationTest = ProcessInfo.processInfo.environment["FLUX_TEST_SWD_MIGRATION"] == "1"
+#else
+        let finishInstallTest = false
+        let rebootVerifyTest = false
+        let pnpRestartTest = false
+        let swdMigrationTest = false
+#endif
+        let competingModes = [
+            tpCertutilTest ? "FLUX_TEST_TP_CERTUTIL" : nil,
+            signingPolicyAuditTest ? "FLUX_TEST_SIGNING_AUDIT" : nil
+        ].compactMap { $0 }.joined(separator: ",")
+        guard tpCertutilTest || signingPolicyAuditTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest else {
+            if let val = launcherFlagValue {
+                Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] timestamp=\(launchTimestamp) flagValue=\(val) schedulerEntered=NO timerArmed=NO skipReason=FLAG_VALUE_NOT_1")
+            }
+            return
+        }
+        if signingPolicyLauncherTest {
+            let flagValStr = launcherFlagValue ?? "<absent>"
+            let compModesStr = competingModes.isEmpty ? "NONE" : competingModes
+            Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] timestamp=\(launchTimestamp) flagPresent=YES flagValue=\(flagValStr) schedulerEntered=YES competingModes=\(compModesStr)")
+        }
+        lock.lock()
+        let oneShotBefore = testStarted
+        guard !testStarted else {
+            lock.unlock()
+            if swdMigrationTest {
+                self.runSwdMigrationTest()
+            } else if pnpRestartTest {
+                self.runPnpRestartTest()
+            } else if rebootVerifyTest {
+                self.runRebootVerifyTest()
+            } else if finishInstallTest {
+                self.runFinishInstallTest()
+            } else if signingPolicyLauncherTest {
+                Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] oneShotBefore=\(oneShotBefore) oneShotAfter=\(oneShotBefore) timerArmed=NO skipReason=ONE_SHOT_ALREADY_SET")
+            }
+            return
+        }
+        testStarted = true
+        let oneShotAfter = testStarted
+        lock.unlock()
+        if signingPolicyLauncherTest {
+            Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] oneShotBefore=\(oneShotBefore) oneShotAfter=\(oneShotAfter) timerArmed=YES delaySeconds=75")
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 75.0) { [weak self] in
+            if swdMigrationTest {
+                self?.runSwdMigrationTest()
+            } else if pnpRestartTest {
+                self?.runPnpRestartTest()
+            } else if rebootVerifyTest {
+                self?.runRebootVerifyTest()
+            } else if signingPolicyLauncherTest {
+                Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] timerFired=YES targetFunctionReached=YES")
+                self?.runSigningPolicyLauncherTest()
+            } else if devNodeCreateTest {
+                self?.runDevNodeCreateTest()
+            } else if signingPolicyAuditTest {
+                self?.runSigningPolicyAuditTest()
+            } else {
+                self?.runTpCertutilTest()
+            }
+        }
+    }
+
     func notifyEP3Armed() {
-        guard ProcessInfo.processInfo.environment["FLUX_TEST_HID_KEYBOARD"] == "1" else { return }
+        let liveKeyboardTest = ProcessInfo.processInfo.environment["FLUX_TEST_HID_KEYBOARD"] == "1"
+        let winRAutomationTest = ProcessInfo.processInfo.environment["FLUX_TEST_WINR_AUTOMATION"] == "1"
+        let uacTraceTest = ProcessInfo.processInfo.environment["FLUX_TEST_UAC_TRACE"] == "1"
+        let tpCertutilTest = ProcessInfo.processInfo.environment["FLUX_TEST_TP_CERTUTIL"] == "1"
+        let signingPolicyAuditTest = ProcessInfo.processInfo.environment["FLUX_TEST_SIGNING_AUDIT"] == "1"
+        let signingPolicyAuditStageTest = ProcessInfo.processInfo.environment["FLUX_TEST_SIGNING_AUDIT_STAGE"] == "1"
+        let signingPolicyLauncherTest = ProcessInfo.processInfo.environment["FLUX_TEST_SIGNING_LAUNCHER"] == "1"
+        let devNodeCreateTest = ProcessInfo.processInfo.environment["FLUX_TEST_DEVNODE_CREATE"] == "1"
+#if DEBUG
+        let finishInstallTest = ProcessInfo.processInfo.environment["FLUX_TEST_FINISH_INSTALL"] == "1"
+        let rebootVerifyTest = ProcessInfo.processInfo.environment["FLUX_TEST_REBOOT_VERIFY"] == "1"
+        let pnpRestartTest = ProcessInfo.processInfo.environment["FLUX_TEST_PNP_RESTART"] == "1"
+        let swdMigrationTest = ProcessInfo.processInfo.environment["FLUX_TEST_SWD_MIGRATION"] == "1"
+#else
+        let finishInstallTest = false
+        let rebootVerifyTest = false
+        let pnpRestartTest = false
+        let swdMigrationTest = false
+#endif
+        guard liveKeyboardTest || winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest else { return }
         lock.lock()
         if testStarted {
             lock.unlock()
+            if signingPolicyLauncherTest {
+                Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] ep3Callback=YES oneShotBefore=true timerArmed=NO skipReason=LAUNCH_SCHEDULER_OWNS_ONE_SHOT")
+            }
             return
         }
         testStarted = true
         lock.unlock()
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) { [weak self] in
+        let delay: TimeInterval = (winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest) ? 60.0 : 2.5
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            self.runLiveValidationTest()
+            if swdMigrationTest {
+                self.runSwdMigrationTest()
+            } else if pnpRestartTest {
+                self.runPnpRestartTest()
+            } else if rebootVerifyTest {
+                self.runRebootVerifyTest()
+            } else if finishInstallTest {
+                self.runFinishInstallTest()
+            } else if devNodeCreateTest {
+                self.runDevNodeCreateTest()
+            } else if signingPolicyLauncherTest {
+                self.runSigningPolicyLauncherTest()
+            } else if signingPolicyAuditStageTest {
+                self.stageSigningPolicyAuditScript()
+            } else if signingPolicyAuditTest {
+                self.runSigningPolicyAuditTest()
+            } else if tpCertutilTest {
+                self.runTpCertutilTest()
+            } else if uacTraceTest {
+                self.runUacLifetimeTraceTest()
+            } else if winRAutomationTest {
+                self.runWinRAutomationControlTest()
+            } else {
+                self.runLiveValidationTest()
+            }
         }
     }
 
@@ -356,7 +536,7 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
 
     /// Opens Windows Run dialog (Win+R), types command, and presses Enter.
     /// - Parameter charDelay: Per-character delay in seconds (default 0.05s). Use 0.005s for fast typing of long payloads.
-    func sendWinR(command: String, charDelay: TimeInterval = 0.05) {
+    func sendWinR(command: String, charDelay: TimeInterval = 0.02) {
         // Press Win+R
         handleFlagsChanged(keyCode: 55, rawFlags: 0x0008 | 0x100000) // Command / Win
         Thread.sleep(forTimeInterval: 0.1)
@@ -367,12 +547,21 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         handleFlagsChanged(keyCode: 55, rawFlags: 0) // Release Win
         Thread.sleep(forTimeInterval: 4.0) // wait for Run dialog to fully open and focus
 
-        // Erase any previous command or leaked hotkey character by sending Backspace repeatedly
-        for _ in 0..<50 {
+        // Erase any previous command by selecting all (Ctrl+A) and deleting, plus repeated Backspaces
+        handleFlagsChanged(keyCode: 59, rawFlags: 0x0001 | 0x40000) // Control down
+        Thread.sleep(forTimeInterval: 0.05)
+        handleKeyDown(keyCode: 0x00, isRepeat: false) // A down
+        Thread.sleep(forTimeInterval: 0.05)
+        handleKeyUp(keyCode: 0x00) // A up
+        Thread.sleep(forTimeInterval: 0.05)
+        handleFlagsChanged(keyCode: 59, rawFlags: 0) // Control up
+        Thread.sleep(forTimeInterval: 0.1)
+
+        for _ in 0..<60 {
             handleKeyDown(keyCode: 0x33, isRepeat: false) // Backspace
-            Thread.sleep(forTimeInterval: 0.008)
+            Thread.sleep(forTimeInterval: 0.005)
             handleKeyUp(keyCode: 0x33)
-            Thread.sleep(forTimeInterval: 0.008)
+            Thread.sleep(forTimeInterval: 0.005)
         }
         Thread.sleep(forTimeInterval: 0.3)
 
@@ -380,11 +569,468 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         typeString(command, charDelay: charDelay)
         Thread.sleep(forTimeInterval: 0.8)
 
-        // Press Enter
+        // Press Enter twice (first closes autocomplete dropdown if open, second submits dialog)
+        handleKeyDown(keyCode: 0x24, isRepeat: false) // Enter
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyUp(keyCode: 0x24)
+        Thread.sleep(forTimeInterval: 0.4)
         handleKeyDown(keyCode: 0x24, isRepeat: false) // Enter
         Thread.sleep(forTimeInterval: 0.15)
         handleKeyUp(keyCode: 0x24)
     }
+
+    /// Test-only, command-free control for validating the synthetic Win+R
+    /// hotkey and the ordinary synthetic character path. It performs no UAC,
+    /// no watcher launch, and no Enter submission.
+    private func runWinRAutomationControlTest() {
+        print("[AUTO-KEY] CONTROL_TEST_START")
+        resetState()
+        Thread.sleep(forTimeInterval: 1.0)
+
+        // Control 1: exactly Left GUI down, R down, R up, Left GUI up.
+        sendAutoFlagsChanged(55, rawFlags: 0x0008 | 0x100000, action: "DOWN")
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoKeyDown(0x0F)
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoKeyUp(0x0F)
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoFlagsChanged(55, rawFlags: 0, action: "UP")
+        Thread.sleep(forTimeInterval: 3.0)
+        FluxVM.captureCurrentScreenshot(path: FluxVM.defaultAppDirectory() + "/winr-control-1.bmp")
+        appendAutoKeyTrace(action: "ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+
+        // Control 2: type only abc, without Enter, using distinct down/up pairs.
+        for keyCode: UInt16 in [0x00, 0x0B, 0x08] {
+            sendAutoKeyDown(keyCode)
+            Thread.sleep(forTimeInterval: 0.15)
+            sendAutoKeyUp(keyCode)
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        FluxVM.captureCurrentScreenshot(path: FluxVM.defaultAppDirectory() + "/winr-control-abc.bmp")
+        appendAutoKeyTrace(action: "ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+
+        // Control 3: dismiss the Run dialog normally, verify zero report, then trigger synthetic Win+R a second time
+        Thread.sleep(forTimeInterval: 2.0)
+        sendAutoKeyDown(0x35) // Escape
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoKeyUp(0x35)
+        Thread.sleep(forTimeInterval: 1.5)
+        appendAutoKeyTrace(action: "ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+
+        // Second Win+R
+        sendAutoFlagsChanged(55, rawFlags: 0x0008 | 0x100000, action: "DOWN")
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoKeyDown(0x0F)
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoKeyUp(0x0F)
+        Thread.sleep(forTimeInterval: 0.15)
+        sendAutoFlagsChanged(55, rawFlags: 0, action: "UP")
+        Thread.sleep(forTimeInterval: 3.0)
+        FluxVM.captureCurrentScreenshot(path: FluxVM.defaultAppDirectory() + "/winr-control-2.bmp")
+        appendAutoKeyTrace(action: "ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+
+        print("[AUTO-KEY] CONTROL_TEST_COMPLETE")
+    }
+
+    // MARK: - Synchronized UAC Lifetime Trace Test
+
+    private func isConsentDialogPresent() -> Bool {
+        let snap = FluxFramebuffer.shared.snapshot()
+        guard snap.isConfigured, let ptr = snap.hostPointer, snap.width >= 800, snap.height >= 600 else {
+            return false
+        }
+        let pixelOffset = (300 * snap.stride) + (400 * 4)
+        let b = ptr.load(fromByteOffset: pixelOffset, as: UInt8.self)
+        let g = ptr.load(fromByteOffset: pixelOffset + 1, as: UInt8.self)
+        let r = ptr.load(fromByteOffset: pixelOffset + 2, as: UInt8.self)
+        print("[UAC-TRACE] Framebuffer center pixel: R=\(r) G=\(g) B=\(b)")
+        return (r > 200 && g > 200 && b > 200)
+    }
+
+    private func isFramebufferBlack() -> Bool {
+        let snap = FluxFramebuffer.shared.snapshot()
+        guard snap.isConfigured, let ptr = snap.hostPointer, snap.width >= 800, snap.height >= 600 else {
+            return false
+        }
+        var total = 0
+        for (sx, sy) in [(200, 200), (400, 300), (600, 400), (100, 500)] {
+            let offset = (sy * snap.stride) + (sx * 4)
+            let b = Int(ptr.load(fromByteOffset: offset, as: UInt8.self))
+            let g = Int(ptr.load(fromByteOffset: offset + 1, as: UInt8.self))
+            let r = Int(ptr.load(fromByteOffset: offset + 2, as: UInt8.self))
+            total += (r + g + b)
+        }
+        return total < 20
+    }
+
+    private func runUacLifetimeTraceTest() {
+        print("[UAC-TRACE] ==================================================")
+        print("[UAC-TRACE] Starting Synchronized UAC Lifetime Trace Test")
+        print("[UAC-TRACE] ==================================================")
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let appDir = FluxVM.defaultAppDirectory()
+
+        // 1. Prepare watcher script: copy watch.ps1 to flux_uac_watch.ps1 and remove old watch.txt
+        print("[UAC-TRACE] Step 1: Preparing watcher script via internal Win+R")
+        sendWinR(command: "cmd /c copy /y C:\\Users\\Public\\flux_uac\\watch.ps1 C:\\Users\\Public\\flux_uac_watch.ps1 & del /f /q C:\\Users\\Public\\flux_uac_watch.txt")
+        Thread.sleep(forTimeInterval: 3.5)
+
+        // 2. Start watcher using internal synthetic HID Win+R only
+        print("[UAC-TRACE] Step 2: Starting watcher via internal synthetic HID Win+R")
+        let watcherCmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"C:\\Users\\Public\\flux_uac_watch.ps1\""
+        sendWinR(command: watcherCmd)
+        appendAutoKeyTrace(action: "WATCHER_LAUNCH_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+
+        // 3. Wait 4 seconds for watcher arming
+        print("[UAC-TRACE] Step 3: Waiting 4.0s for watcher arming")
+        Thread.sleep(forTimeInterval: 4.0)
+
+        // 4. Input idle state: verify keyboard report [00 00 ...] and pointer buttons 0, wait >= 2.0s
+        print("[UAC-TRACE] Step 4: Verifying idle state and waiting 2.0s")
+        appendAutoKeyTrace(action: "IDLE_STATE_KEYBOARD_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 2.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-before-click.bmp")
+
+        // 5. Trigger FluxUacNoOp shortcut via pointer only
+        print("[UAC-TRACE] Step 5: Moving pointer to FluxUacNoOp (guestX=42, guestY=251, hidX=1722, hidY=13730) and double-clicking")
+        FluxHIDPointer.shared.updatePosition(x: 1722, y: 13730)
+        Thread.sleep(forTimeInterval: 0.3)
+        // Double-click pointer only
+        FluxHIDPointer.shared.updateButtons(0x01)
+        Thread.sleep(forTimeInterval: 0.08)
+        FluxHIDPointer.shared.updateButtons(0x00)
+        Thread.sleep(forTimeInterval: 0.08)
+        FluxHIDPointer.shared.updateButtons(0x01)
+        Thread.sleep(forTimeInterval: 0.08)
+        FluxHIDPointer.shared.updateButtons(0x00)
+        print("[UAC-TRACE] Trigger sent. Observing UAC sequence without input...")
+
+        // 6. UAC Observation over 65 seconds
+        Thread.sleep(forTimeInterval: 1.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-1s.bmp")
+        print("[UAC-TRACE] t=1s: black=\(isFramebufferBlack()) dialog=\(isConsentDialogPresent())")
+
+        Thread.sleep(forTimeInterval: 2.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-3s.bmp")
+        print("[UAC-TRACE] t=3s: black=\(isFramebufferBlack()) dialog=\(isConsentDialogPresent())")
+
+        Thread.sleep(forTimeInterval: 3.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-6s.bmp")
+        print("[UAC-TRACE] t=6s: black=\(isFramebufferBlack()) dialog=\(isConsentDialogPresent())")
+
+        Thread.sleep(forTimeInterval: 4.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-10s.bmp")
+        let dialogPresentAt10s = isConsentDialogPresent()
+        let blackAt10s = isFramebufferBlack()
+        print("[UAC-TRACE] t=10s: black=\(blackAt10s) dialog=\(dialogPresentAt10s)")
+
+        if dialogPresentAt10s {
+            print("[UAC-TRACE] Consent dialog is stable after 10s of capture. Manually choosing 'No'...")
+            FluxHIDPointer.shared.updatePosition(x: 20709, y: 24403)
+            Thread.sleep(forTimeInterval: 0.2)
+            FluxHIDPointer.shared.updateButtons(0x01)
+            Thread.sleep(forTimeInterval: 0.1)
+            FluxHIDPointer.shared.updateButtons(0x00)
+            Thread.sleep(forTimeInterval: 0.3)
+            handleKeyDown(keyCode: 0x35, isRepeat: false)
+            Thread.sleep(forTimeInterval: 0.1)
+            handleKeyUp(keyCode: 0x35)
+            Thread.sleep(forTimeInterval: 1.0)
+            FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-after-no.bmp")
+        } else {
+            print("[UAC-TRACE] Dialog not present at t=10s (auto-canceled or closed). Observing natural return...")
+        }
+
+        Thread.sleep(forTimeInterval: 5.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-15s.bmp")
+
+        Thread.sleep(forTimeInterval: 15.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-30s.bmp")
+
+        Thread.sleep(forTimeInterval: 20.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-50s.bmp")
+
+        Thread.sleep(forTimeInterval: 15.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-obs-65s.bmp")
+
+        print("[UAC-TRACE] 60-second watcher completed. Observation finished.")
+        print("[UAC-TRACE] TEST_COMPLETE")
+    }
+
+    // MARK: - TrustedPublisher certutil Diagnostic Test
+
+    private func runTpCertutilTest() {
+        print("[UAC-CERTUTIL] ==================================================")
+        print("[UAC-CERTUTIL] Starting TrustedPublisher certutil Diagnostic Test")
+        print("[UAC-CERTUTIL] ==================================================")
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let appDir = FluxVM.defaultAppDirectory()
+
+        // Diagnostic-only watcher preparation before the unchanged RunAs
+        // command.  Preserve the existing watcher body, extending only its
+        // passive sampling limit from 60 to 180 seconds.
+        let watcherPrepCmd = "powershell.exe -NoProfile -Command \"$s=Get-Content 'C:\\Users\\Public\\flux_uac\\watch.ps1' -Raw;$s=$s.Replace('AddSeconds(60)','AddSeconds(180)');[IO.File]::WriteAllText('C:\\Users\\Public\\flux_uac_watch.ps1',$s);Remove-Item 'C:\\Users\\Public\\flux_uac_watch.txt' -Force -ErrorAction SilentlyContinue\""
+        sendWinR(command: watcherPrepCmd)
+        Thread.sleep(forTimeInterval: 3.5)
+        sendWinR(command: "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"C:\\Users\\Public\\flux_uac_watch.ps1\"")
+        appendAutoKeyTrace(action: "RUNAS_WATCHER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        Thread.sleep(forTimeInterval: 4.0)
+
+        // 1. Stage the script from driver media to C:\Users\Public\flux_tp_certutil.ps1
+        print("[UAC-CERTUTIL] Step 1: Copying diagnostic script via internal Win+R")
+        let copyCmd = "cmd /c for %d in (D E F) do if exist %d:\\flux_tp_certutil.ps1 copy /y %d:\\flux_tp_certutil.ps1 C:\\Users\\Public\\flux_tp_certutil.ps1 & del /f /q C:\\Users\\Public\\flux_tp_certutil_evidence.txt"
+        sendWinR(command: copyCmd)
+        Thread.sleep(forTimeInterval: 5.0)
+
+        // 2. Launch elevated script via Start-Process ... -Verb RunAs
+        print("[UAC-CERTUTIL] Step 2: Triggering UAC via Start-Process ... -Verb RunAs")
+        let uacCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\Users\\Public\\flux_tp_certutil.ps1' -Verb RunAs\""
+        // The RunAs command is deliberately unchanged. Its internal Win+R
+        // typing is slow, so retain a passive 180-second record that continues
+        // until consent has been gone on the normal desktop for two seconds,
+        // plus three further seconds of capture.
+        let lifeCaptureStart = ISO8601DateFormatter().string(from: Date())
+        Self.appendKeyboardTrace("[UAC-LIFE] CAPTURE_STARTED timestamp=\(lifeCaptureStart) frame=0")
+        DispatchQueue.global().async { [weak self] in
+            var consentWasPresent = false
+            var consentHasAppeared = false
+            var normalFramesAfterConsent = 0
+            var trailingFrames = 0
+            for index in 0..<720 {
+                FluxVM.captureCurrentScreenshot(path: appDir + String(format: "/uac-life-%03d.bmp", index))
+                let consentIsPresent = self?.isConsentDialogPresent() ?? false
+                let framebufferIsBlack = self?.isFramebufferBlack() ?? true
+                let timestamp = ISO8601DateFormatter().string(from: Date())
+                if consentIsPresent && !consentWasPresent {
+                    Self.appendKeyboardTrace("[UAC-LIFE] CONSENT_DETECTED timestamp=\(timestamp) frame=\(index)")
+                }
+                if consentIsPresent { consentHasAppeared = true }
+                if consentHasAppeared && !consentIsPresent && !framebufferIsBlack {
+                    normalFramesAfterConsent += 1
+                } else if consentIsPresent || framebufferIsBlack {
+                    normalFramesAfterConsent = 0
+                }
+                if normalFramesAfterConsent == 8 {
+                    Self.appendKeyboardTrace("[UAC-LIFE] CONSENT_GONE timestamp=\(timestamp) frame=\(index)")
+                    trailingFrames = 12
+                } else if trailingFrames > 0 {
+                    trailingFrames -= 1
+                    if trailingFrames == 0 { break }
+                }
+                consentWasPresent = consentIsPresent
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
+        sendWinR(command: uacCmd)
+        appendAutoKeyTrace(action: "UAC_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+
+        // 3. Wait for consent dialog to appear and stabilize
+        print("[UAC-CERTUTIL] Step 3: Waiting for UAC consent dialog to appear")
+        var dialogAppeared = false
+        for _ in 0..<15 {
+            Thread.sleep(forTimeInterval: 0.5)
+            if isConsentDialogPresent() {
+                dialogAppeared = true
+                break
+            }
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/uac-consent-awaiting-user.bmp")
+        print("[UAC-CERTUTIL] Consent dialog detected: \(dialogAppeared)")
+        print("[UAC-CERTUTIL] CONSENT_DIALOG_VISIBLE_AWAITING_USER_APPROVAL")
+
+        // 4. Await user manual approval (DO NOT synthesize approval)
+        print("[UAC-CERTUTIL] Awaiting user manual selection in Flux VM window...")
+        var waitSeconds = 0
+        while isConsentDialogPresent() && waitSeconds < 180 {
+            Thread.sleep(forTimeInterval: 1.0)
+            waitSeconds += 1
+            if waitSeconds % 10 == 0 {
+                print("[UAC-CERTUTIL] Still awaiting user selection (\(waitSeconds)s elapsed)...")
+            }
+        }
+
+        print("[UAC-CERTUTIL] Consent dialog dismissed. Waiting 8.0s for script completion...")
+        Thread.sleep(forTimeInterval: 8.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/after_user_approval.bmp")
+        print("[UAC-CERTUTIL] SCRIPT_EXECUTION_COMPLETE")
+    }
+
+    // MARK: - Read-only Signing Policy Audit
+
+    /// Phase-one staging only: copy the audit script into the guest. This path
+    /// has no RunAs invocation and cannot trigger UAC.
+    private func stageSigningPolicyAuditScript() {
+        resetState()
+        let copyCommand = "cmd /c for %d in (D E F) do if exist %d:\\flux_signing_policy_audit_admin.ps1 copy /y %d:\\flux_signing_policy_audit_admin.ps1 C:\\Users\\Public\\flux_signing_policy_audit_admin.ps1"
+        sendWinR(command: copyCommand)
+        appendAutoKeyTrace(action: "SIGNING_AUDIT_STAGE_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+    }
+
+    /// Non-elevated diagnostic wrapper: it stages and runs only the launcher
+    /// script, which records the exact Start-Process -Verb RunAs result.
+    private func runSigningPolicyLauncherTest() {
+        resetState()
+        let launcherCommand = "cmd /c for %d in (D E F) do if exist %d:\\flux_signing_policy_launcher.ps1 powershell.exe -NoProfile -ExecutionPolicy Bypass -File %d:\\flux_signing_policy_launcher.ps1"
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "SIGNING_LAUNCHER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+    }
+
+    /// Test-only entry point. It stages a read-only audit script, then uses
+    /// Start-Process -Verb RunAs only when FLUX_TEST_SIGNING_AUDIT is supplied
+    /// to a future Flux launch. Phase-one preparation never calls this method.
+    private func runSigningPolicyAuditTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let copyCommand = "cmd /c for %d in (D E F) do if exist %d:\\flux_signing_policy_audit_admin.ps1 copy /y %d:\\flux_signing_policy_audit_admin.ps1 C:\\Users\\Public\\flux_signing_policy_audit_admin.ps1"
+        sendWinR(command: copyCommand)
+        Thread.sleep(forTimeInterval: 5.0)
+
+        let auditRunAsCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\Users\\Public\\flux_signing_policy_audit_admin.ps1' -Verb RunAs\""
+        sendWinR(command: auditRunAsCommand)
+        appendAutoKeyTrace(action: "SIGNING_AUDIT_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+    }
+
+    /// Opt-in, fixed-command path for the single root-devnode creation
+    /// milestone. It reuses the established internal Win+R HID path and
+    /// sends no approval input after Windows displays consent.
+    private func runDevNodeCreateTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let launcherCommand = "powershell.exe -NoProfile -Command \"Start-Process 'D:\\FluxDevNodeCreate.cmd' -Verb RunAs\""
+        print("[DEVNODE-CREATE] Launching fixed elevated launcher")
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "DEVNODE_CREATE_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[DEVNODE-CREATE] UAC consent must be approved manually if displayed")
+    }
+
+#if DEBUG
+    /// Temporary fixed-command installer route.
+    private func runFinishInstallTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let launcherCommand = "powershell.exe -NoProfile -Command \"Start-Process 'D:\\FluxIdd\\finish-install.cmd' -Verb RunAs\""
+        print("[FINISH-INSTALL] Launching fixed elevated installer")
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "FINISH_INSTALL_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[FINISH-INSTALL] Submitted fixed installer command; awaiting manual UAC approval if shown")
+    }
+
+    /// Fixed-command reboot verification route.
+    private func runRebootVerifyTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let launcherCommand = "cmd.exe /c for %d in (D E F) do if exist %d:\\FluxRebootVerify.cmd %d:\\FluxRebootVerify.cmd"
+        print("[REBOOT-VERIFY] Launching fixed verification script via Win+R")
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "REBOOT_VERIFY_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[REBOOT-VERIFY] Submitted fixed verification command via Win+R")
+
+        let appDir = FluxVM.defaultAppDirectory()
+        Thread.sleep(forTimeInterval: 3.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/reboot-verify-launched.bmp")
+        Thread.sleep(forTimeInterval: 25.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/reboot-verify-complete.bmp")
+        print("[REBOOT-VERIFY] Verification execution window completed")
+    }
+
+    /// Fixed-command PnP restart verification route.
+    private func runPnpRestartTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let launcherCommand = "powershell.exe -NoProfile -Command \"Start-Process 'D:\\FluxPnpRestart.cmd' -Verb RunAs\""
+        print("[PNP-RESTART] Launching fixed elevated PnP restart script via Win+R")
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "PNP_RESTART_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[PNP-RESTART] Submitted fixed restart command via Win+R")
+
+        let appDir = FluxVM.defaultAppDirectory()
+        Thread.sleep(forTimeInterval: 4.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/pnp-restart-launched.bmp")
+
+        // Approve UAC consent dialog:
+        // Left Arrow (0x7B) moves focus from 'No' to 'Yes', Enter (0x24) activates 'Yes'
+        print("[PNP-RESTART] Approving UAC consent dialog...")
+        FluxHIDPointer.shared.updatePosition(x: 12042, y: 24357) // Yes button center
+        Thread.sleep(forTimeInterval: 0.2)
+        FluxHIDPointer.shared.updateButtons(0x01)
+        Thread.sleep(forTimeInterval: 0.1)
+        FluxHIDPointer.shared.updateButtons(0x00)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        handleKeyDown(keyCode: 0x7B, isRepeat: false) // Left Arrow
+        Thread.sleep(forTimeInterval: 0.1)
+        handleKeyUp(keyCode: 0x7B)
+        Thread.sleep(forTimeInterval: 0.2)
+        handleKeyDown(keyCode: 0x24, isRepeat: false) // Enter
+        Thread.sleep(forTimeInterval: 0.1)
+        handleKeyUp(keyCode: 0x24)
+
+        Thread.sleep(forTimeInterval: 35.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/pnp-restart-complete.bmp")
+        print("[PNP-RESTART] PnP restart execution window completed")
+    }
+
+    /// Fixed-command SWD migration verification route.
+    private func runSwdMigrationTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let launcherCommand = "powershell.exe -NoProfile -Command \"Start-Process 'D:\\FluxSwdMigration.cmd' -Verb RunAs\""
+        print("[SWD-MIGRATION] Launching fixed elevated migration script via Win+R")
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "SWD_MIGRATION_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[SWD-MIGRATION] Submitted fixed migration command via Win+R")
+
+        let appDir = FluxVM.defaultAppDirectory()
+        Thread.sleep(forTimeInterval: 4.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/swd-migration-launched.bmp")
+
+        // Approve UAC consent dialog:
+        // In Windows UAC, Alt+Y directly activates the "Yes" button.
+        print("[SWD-MIGRATION] Approving UAC consent dialog via Alt+Y...")
+        handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyUp(keyCode: 0x10) // Y up
+        Thread.sleep(forTimeInterval: 0.15)
+        handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Send a second Alt+Y in case the first was during secure desktop transition
+        handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyUp(keyCode: 0x10) // Y up
+        Thread.sleep(forTimeInterval: 0.15)
+        handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+
+        Thread.sleep(forTimeInterval: 50.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/swd-migration-complete.bmp")
+        print("[SWD-MIGRATION] SWD migration execution window completed")
+    }
+#endif
 
     /// Test-only Win+R submission that preserves the normal command text,
     /// typing delay, and single-Enter sequence while allowing a framebuffer
