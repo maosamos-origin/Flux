@@ -44,10 +44,14 @@ struct SwapChainSession final {
     ComPtr<IDXGIDevice> dxgiDevice;
     volatile LONG64 frameAcquireCount;
     volatile LONG64 frameProcessedCount;
+    volatile LONG64 frameReleaseCount;
+    volatile LONG64 surfaceSignalCount;
     volatile LONG64 frameProcessingErrorCount;
     volatile LONG lastWidth;
     volatile LONG lastHeight;
     volatile LONG lastFormat;
+    volatile LONG firstFrameWidth;
+    volatile LONG firstFrameHeight;
     volatile LONG setDeviceCalled;
     volatile LONG setDeviceHr;
 };
@@ -65,10 +69,14 @@ static SwapChainSession* CreateSwapChainSession() {
         s->renderAdapterLuid = {};
         s->frameAcquireCount = 0;
         s->frameProcessedCount = 0;
+        s->frameReleaseCount = 0;
+        s->surfaceSignalCount = 0;
         s->frameProcessingErrorCount = 0;
         s->lastWidth = 0;
         s->lastHeight = 0;
         s->lastFormat = 0;
+        s->firstFrameWidth = 0;
+        s->firstFrameHeight = 0;
         s->setDeviceCalled = 0;
         s->setDeviceHr = 0;
     }
@@ -91,24 +99,29 @@ static void ReleaseSession(SwapChainSession*& s) {
 }
 
 static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UINT format,
-                                  LONG64 acq, LONG64 proc, LONG64 err,
-                                  LONG setDeviceCalled = 0, LONG setDeviceHr = 0) {
+                                  LONG64 acq, LONG64 proc, LONG64 rel, LONG64 sig, LONG64 err,
+                                  LONG setDeviceCalled = 0, LONG setDeviceHr = 0,
+                                  UINT firstWidth = 0, UINT firstHeight = 0) {
     HANDLE hFile = CreateFileA("C:\\Users\\Public\\flux_swapchain_status.txt",
                                GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile != INVALID_HANDLE_VALUE) {
-        char buf[768];
+        char buf[896];
         int len = sprintf_s(buf, sizeof(buf),
             "SWAPCHAIN_ASSIGN_CALLED=YES\r\n"
             "SWAPCHAIN_WORKER_STARTED=YES\r\n"
             "SET_DEVICE_CALLED=%s\r\n"
             "SET_DEVICE_HR=0x%08X\r\n"
             "SURFACE_AVAILABLE_SIGNAL_SEEN=%s\r\n"
+            "SURFACE_SIGNAL_COUNT=%lld\r\n"
             "FRAME_ACQUIRE_SUCCESS=%s\r\n"
             "FRAME_ACQUIRE_COUNT=%lld\r\n"
+            "FRAME_RELEASE_COUNT=%lld\r\n"
             "FRAME_PROCESSED_COUNT=%lld\r\n"
             "FRAME_PROCESSING_ERROR_COUNT=%lld\r\n"
             "FRAME_DELIVERY=%s\r\n"
+            "FIRST_FRAME_WIDTH=%u\r\n"
+            "FIRST_FRAME_HEIGHT=%u\r\n"
             "FRAME_WIDTH=%u\r\n"
             "FRAME_HEIGHT=%u\r\n"
             "FRAME_FORMAT=%u\r\n"
@@ -119,12 +132,16 @@ static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UI
             "WORKER_STATE=%s\r\n",
             setDeviceCalled ? "YES" : "NO",
             static_cast<UINT>(setDeviceHr),
-            proc > 0 ? "YES" : (acq > 0 ? "YES" : "WAITING"),
+            (sig > 0 || acq > 0) ? "YES" : "NO",
+            sig,
             acq > 0 ? "YES" : "NO",
             acq,
+            rel,
             proc,
             err,
             proc > 0 ? "YES" : "NO",
+            firstWidth,
+            firstHeight,
             width, height, format,
             proc,
             proc > 0 ? "YES" : "NO",
@@ -261,11 +278,11 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
             char msg[128];
             sprintf_s(msg, sizeof(msg), "FluxIdd: Worker IddCxSwapChainSetDevice failed: 0x%08X\n", hr);
             OutputDebugStringA(msg);
-            WriteDiagnosticStatus("SET_DEVICE_FAILED", 0, 0, 0, 0, 0, 1, 1, hr);
+            WriteDiagnosticStatus("SET_DEVICE_FAILED", 0, 0, 0, 0, 0, 0, 0, 1, 1, hr, 0, 0);
             goto Cleanup;
         }
         OutputDebugStringA("FluxIdd: Worker IddCxSwapChainSetDevice succeeded\n");
-        WriteDiagnosticStatus("RUNNING", 0, 0, 0, 0, 0, 0, 1, hr);
+        WriteDiagnosticStatus("RUNNING", 0, 0, 0, 0, 0, 0, 0, 0, 1, hr, 0, 0);
     }
 
     for (;;) {
@@ -286,7 +303,8 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                 break;
             } else if (waitRes == WAIT_OBJECT_0 + 1) {
                 // Index 1: hNextSurfaceAvailable
-                if (InterlockedCompareExchange64(&session->frameAcquireCount, 0, 0) == 0) {
+                LONG64 sig = InterlockedIncrement64(&session->surfaceSignalCount);
+                if (sig == 1) {
                     OutputDebugStringA("FluxIdd: SURFACE_AVAILABLE_SIGNAL_SEEN\n");
                 }
                 continue;
@@ -323,11 +341,16 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         InterlockedExchange(&session->lastWidth, static_cast<LONG>(width));
                         InterlockedExchange(&session->lastHeight, static_cast<LONG>(height));
                         InterlockedExchange(&session->lastFormat, static_cast<LONG>(format));
+                        if (InterlockedCompareExchange(&session->firstFrameWidth, static_cast<LONG>(width), 0) == 0) {
+                            InterlockedExchange(&session->firstFrameHeight, static_cast<LONG>(height));
+                        }
                     }
                 }
                 // Release the COM reference held by Attach
                 dxgiResource.Reset();
             }
+
+            LONG64 rel = InterlockedIncrement64(&session->frameReleaseCount);
 
             if (!surfaceValid) {
                 InterlockedIncrement64(&session->frameProcessingErrorCount);
@@ -350,12 +373,15 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
 
                 if (proc == 1 || proc == 2 || proc == 10 || (proc % 60 == 0)) {
                     LONG64 err = InterlockedCompareExchange64(&session->frameProcessingErrorCount, 0, 0);
+                    LONG64 sig = InterlockedCompareExchange64(&session->surfaceSignalCount, 0, 0);
+                    UINT firstW = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameWidth, 0, 0));
+                    UINT firstH = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameHeight, 0, 0));
                     char msg[256];
                     sprintf_s(msg, sizeof(msg),
-                        "FluxIdd: FRAME_DELIVERY_SUCCESS width=%u height=%u format=%u acquire=%lld processed=%lld errors=%lld\n",
-                        width, height, format, acq, proc, err);
+                        "FluxIdd: FRAME_DELIVERY_SUCCESS width=%u height=%u format=%u acquire=%lld released=%lld processed=%lld errors=%lld\n",
+                        width, height, format, acq, rel, proc, err);
                     OutputDebugStringA(msg);
-                    WriteDiagnosticStatus("ACTIVE", width, height, format, acq, proc, err, 1, session->setDeviceHr);
+                    WriteDiagnosticStatus("ACTIVE", width, height, format, acq, proc, rel, sig, err, 1, session->setDeviceHr, firstW, firstH);
                 }
             } else {
                 // Surface was invalid: frame lifecycle completed cleanly via FinishedProcessingFrame, now terminate loop
@@ -432,10 +458,14 @@ void FluxIddStopWorker(FluxMonitorContext* ctx) {
             UINT f = static_cast<UINT>(InterlockedCompareExchange(&session->lastFormat, 0, 0));
             LONG64 acq = InterlockedCompareExchange64(&session->frameAcquireCount, 0, 0);
             LONG64 proc = InterlockedCompareExchange64(&session->frameProcessedCount, 0, 0);
+            LONG64 rel = InterlockedCompareExchange64(&session->frameReleaseCount, 0, 0);
+            LONG64 sig = InterlockedCompareExchange64(&session->surfaceSignalCount, 0, 0);
             LONG64 err = InterlockedCompareExchange64(&session->frameProcessingErrorCount, 0, 0);
             LONG sdc = InterlockedCompareExchange(&session->setDeviceCalled, 0, 0);
             LONG sdhr = InterlockedCompareExchange(&session->setDeviceHr, 0, 0);
-            WriteDiagnosticStatus("STOPPED", w, h, f, acq, proc, err, sdc, sdhr);
+            UINT firstW = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameWidth, 0, 0));
+            UINT firstH = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameHeight, 0, 0));
+            WriteDiagnosticStatus("STOPPED", w, h, f, acq, proc, rel, sig, err, sdc, sdhr, firstW, firstH);
 
             // Release the monitor's reference
             ReleaseSession(ctx->activeSession);
