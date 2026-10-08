@@ -32,6 +32,25 @@ using Microsoft::WRL::ComPtr;
 //     executes the delayed cleanup of hSwapChain, hTerminateEvent, and hThread itself,
 //     and drops the worker reference (refCount drops to 0 -> session deleted).
 //
+#pragma pack(push, 1)
+struct FluxFrameTransportHeader {
+    char magic[8];          // "FLXFTRAN"
+    UINT32 version;         // 1
+    UINT32 sequence;        // 1, 2, 3...
+    UINT32 width;           // 800
+    UINT32 height;          // 600
+    UINT32 stride;          // 3200
+    UINT32 pixelFormat;     // 87 (DXGI_FORMAT_B8G8R8A8_UNORM)
+    UINT32 dataSize;        // 1,920,000
+    UINT32 status;          // 2 (READY)
+    UINT32 checksum;        // 32-bit additive checksum of pixel bytes
+    UINT32 pixel0;          // sample pixel at (0, 0)
+    UINT32 pixelCenter;     // sample pixel at (width/2, height/2)
+    UINT32 pixelLast;       // sample pixel at (width-1, height-1)
+    UINT32 reserved;        // 0
+};
+#pragma pack(pop)
+
 struct SwapChainSession final {
     volatile LONG refCount;
     volatile LONG cleanupDelegatedToWorker;
@@ -39,9 +58,13 @@ struct SwapChainSession final {
     HANDLE hTerminateEvent;
     HANDLE hNextSurfaceAvailable;
     HANDLE hThread;
+    HANDLE hSerialPort;
     LUID renderAdapterLuid;
     ComPtr<ID3D11Device> d3dDevice;
     ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<ID3D11Texture2D> stagingTexture;
+    UINT stagingWidth;
+    UINT stagingHeight;
     volatile LONG64 frameAcquireCount;
     volatile LONG64 frameProcessedCount;
     volatile LONG64 frameReleaseCount;
@@ -54,6 +77,8 @@ struct SwapChainSession final {
     volatile LONG firstFrameHeight;
     volatile LONG setDeviceCalled;
     volatile LONG setDeviceHr;
+    volatile LONG transportSequence;
+    volatile LONG transportFrameCount;
 };
 
 static SwapChainSession* CreateSwapChainSession() {
@@ -66,6 +91,10 @@ static SwapChainSession* CreateSwapChainSession() {
         s->hTerminateEvent = nullptr;
         s->hNextSurfaceAvailable = nullptr;
         s->hThread = nullptr;
+        s->hSerialPort = INVALID_HANDLE_VALUE;
+        s->stagingTexture = nullptr;
+        s->stagingWidth = 0;
+        s->stagingHeight = 0;
         s->renderAdapterLuid = {};
         s->frameAcquireCount = 0;
         s->frameProcessedCount = 0;
@@ -79,6 +108,8 @@ static SwapChainSession* CreateSwapChainSession() {
         s->firstFrameHeight = 0;
         s->setDeviceCalled = 0;
         s->setDeviceHr = 0;
+        s->transportSequence = 0;
+        s->transportFrameCount = 0;
     }
     return s;
 }
@@ -92,6 +123,11 @@ static void AddRefSession(SwapChainSession* s) {
 static void ReleaseSession(SwapChainSession*& s) {
     if (s) {
         if (InterlockedDecrement(&s->refCount) == 0) {
+            if (s->hSerialPort != INVALID_HANDLE_VALUE) {
+                CloseHandle(s->hSerialPort);
+                s->hSerialPort = INVALID_HANDLE_VALUE;
+            }
+            s->stagingTexture.Reset();
             delete s;
         }
         s = nullptr;
@@ -101,12 +137,13 @@ static void ReleaseSession(SwapChainSession*& s) {
 static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UINT format,
                                   LONG64 acq, LONG64 proc, LONG64 rel, LONG64 sig, LONG64 err,
                                   LONG setDeviceCalled = 0, LONG setDeviceHr = 0,
-                                  UINT firstWidth = 0, UINT firstHeight = 0) {
+                                  UINT firstWidth = 0, UINT firstHeight = 0,
+                                  LONG transSeq = 0, LONG transCount = 0) {
     HANDLE hFile = CreateFileA("C:\\Users\\Public\\flux_swapchain_status.txt",
                                GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile != INVALID_HANDLE_VALUE) {
-        char buf[896];
+        char buf[1024];
         int len = sprintf_s(buf, sizeof(buf),
             "SWAPCHAIN_ASSIGN_CALLED=YES\r\n"
             "SWAPCHAIN_WORKER_STARTED=YES\r\n"
@@ -127,6 +164,9 @@ static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UI
             "FRAME_FORMAT=%u\r\n"
             "SWAPCHAIN_FRAME_COUNT=%lld\r\n"
             "FINISHED_PROCESSING_CALLED=%s\r\n"
+            "FRAME_TRANSPORT_CONNECTED=%s\r\n"
+            "FRAME_TRANSPORT_SEQUENCE=%ld\r\n"
+            "FRAME_TRANSPORT_FRAME_COUNT=%ld\r\n"
             "SWAPCHAIN_UNASSIGN_CALLED=%s\r\n"
             "SWAPCHAIN_WORKER_STOPPED=%s\r\n"
             "WORKER_STATE=%s\r\n",
@@ -145,6 +185,9 @@ static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UI
             width, height, format,
             proc,
             proc > 0 ? "YES" : "NO",
+            transCount > 0 ? "YES" : "NO",
+            transSeq,
+            transCount,
             strcmp(state, "STOPPED") == 0 ? "YES" : "NO",
             strcmp(state, "STOPPED") == 0 ? "YES" : "NO",
             state);
@@ -283,6 +326,28 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
         }
         OutputDebugStringA("FluxIdd: Worker IddCxSwapChainSetDevice succeeded\n");
         WriteDiagnosticStatus("RUNNING", 0, 0, 0, 0, 0, 0, 0, 0, 1, hr, 0, 0);
+
+        // Open COM1 for host frame transport
+        session->hSerialPort = CreateFileA(
+            "\\\\.\\COM1",
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+        if (session->hSerialPort != INVALID_HANDLE_VALUE) {
+            COMMTIMEOUTS timeouts = {};
+            timeouts.WriteTotalTimeoutConstant = 2000;
+            SetCommTimeouts(session->hSerialPort, &timeouts);
+            OutputDebugStringA("FluxIdd: COM1 transport port opened successfully\n");
+        } else {
+            DWORD cErr = GetLastError();
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "FluxIdd: Failed to open COM1 for transport: %lu\n", cErr);
+            OutputDebugStringA(msg);
+        }
     }
 
     for (;;) {
@@ -344,6 +409,28 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         if (InterlockedCompareExchange(&session->firstFrameWidth, static_cast<LONG>(width), 0) == 0) {
                             InterlockedExchange(&session->firstFrameHeight, static_cast<LONG>(height));
                         }
+
+                        // Staging copy for host transport
+                        if (session->d3dDevice) {
+                            if (!session->stagingTexture || session->stagingWidth != width || session->stagingHeight != height) {
+                                session->stagingTexture.Reset();
+                                D3D11_TEXTURE2D_DESC sDesc = desc;
+                                sDesc.Usage = D3D11_USAGE_STAGING;
+                                sDesc.BindFlags = 0;
+                                sDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                                sDesc.MiscFlags = 0;
+                                HRESULT sHr = session->d3dDevice->CreateTexture2D(&sDesc, nullptr, &session->stagingTexture);
+                                if (SUCCEEDED(sHr)) {
+                                    session->stagingWidth = width;
+                                    session->stagingHeight = height;
+                                }
+                            }
+                            if (session->stagingTexture) {
+                                ComPtr<ID3D11DeviceContext> d3dContext;
+                                session->d3dDevice->GetImmediateContext(&d3dContext);
+                                d3dContext->CopyResource(session->stagingTexture.Get(), texture.Get());
+                            }
+                        }
                     }
                 }
                 // Release the COM reference held by Attach
@@ -371,17 +458,90 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
             if (surfaceValid) {
                 LONG64 proc = InterlockedIncrement64(&session->frameProcessedCount);
 
+                // Host Frame Transport transmission (proc <= 5 transmits frames 1..5)
+                if (session->stagingTexture && session->hSerialPort != INVALID_HANDLE_VALUE && proc <= 5) {
+                    ComPtr<ID3D11DeviceContext> d3dContext;
+                    session->d3dDevice->GetImmediateContext(&d3dContext);
+                    D3D11_MAPPED_SUBRESOURCE mapped = {};
+                    HRESULT mapHr = d3dContext->Map(session->stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+                    if (SUCCEEDED(mapHr)) {
+                        UINT stride = mapped.RowPitch;
+                        UINT dataSize = stride * height;
+                        const BYTE* pSrc = static_cast<const BYTE*>(mapped.pData);
+
+                        UINT32 checksum = 0;
+                        for (UINT i = 0; i < dataSize; ++i) {
+                            checksum += pSrc[i];
+                        }
+
+                        UINT32 p0 = (dataSize >= 4) ? *reinterpret_cast<const UINT32*>(pSrc) : 0;
+                        UINT centerOff = (height / 2) * stride + (width / 2) * 4;
+                        UINT32 pCenter = (centerOff + 4 <= dataSize) ? *reinterpret_cast<const UINT32*>(pSrc + centerOff) : 0;
+                        UINT lastOff = (height - 1) * stride + (width - 1) * 4;
+                        UINT32 pLast = (lastOff + 4 <= dataSize) ? *reinterpret_cast<const UINT32*>(pSrc + lastOff) : 0;
+
+                        LONG seq = InterlockedIncrement(&session->transportSequence);
+
+                        FluxFrameTransportHeader hdr = {};
+                        hdr.magic[0] = 'F'; hdr.magic[1] = 'L'; hdr.magic[2] = 'X'; hdr.magic[3] = 'F';
+                        hdr.magic[4] = 'T'; hdr.magic[5] = 'R'; hdr.magic[6] = 'A'; hdr.magic[7] = 'N';
+                        hdr.version = 1;
+                        hdr.sequence = static_cast<UINT32>(seq);
+                        hdr.width = width;
+                        hdr.height = height;
+                        hdr.stride = stride;
+                        hdr.pixelFormat = format;
+                        hdr.dataSize = dataSize;
+                        hdr.status = 2; // READY
+                        hdr.checksum = checksum;
+                        hdr.pixel0 = p0;
+                        hdr.pixelCenter = pCenter;
+                        hdr.pixelLast = pLast;
+                        hdr.reserved = 0;
+
+                        DWORD written = 0;
+                        WriteFile(session->hSerialPort, &hdr, sizeof(hdr), &written, nullptr);
+
+                        const DWORD chunkSize = 65536;
+                        DWORD offset = 0;
+                        while (offset < dataSize) {
+                            if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
+                                break;
+                            }
+                            DWORD toWrite = min(chunkSize, dataSize - offset);
+                            DWORD chunkWritten = 0;
+                            if (!WriteFile(session->hSerialPort, pSrc + offset, toWrite, &chunkWritten, nullptr) || chunkWritten == 0) {
+                                break;
+                            }
+                            offset += chunkWritten;
+                        }
+
+                        d3dContext->Unmap(session->stagingTexture.Get(), 0);
+
+                        if (offset == dataSize) {
+                            InterlockedIncrement(&session->transportFrameCount);
+                            char msg[256];
+                            sprintf_s(msg, sizeof(msg),
+                                "FluxIdd: FRAME_TRANSPORT_SUCCESS seq=%ld width=%u height=%u size=%u checksum=0x%08X\n",
+                                seq, width, height, dataSize, checksum);
+                            OutputDebugStringA(msg);
+                        }
+                    }
+                }
+
                 if (proc == 1 || proc == 2 || proc == 10 || (proc % 60 == 0)) {
                     LONG64 err = InterlockedCompareExchange64(&session->frameProcessingErrorCount, 0, 0);
                     LONG64 sig = InterlockedCompareExchange64(&session->surfaceSignalCount, 0, 0);
                     UINT firstW = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameWidth, 0, 0));
                     UINT firstH = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameHeight, 0, 0));
+                    LONG transSeq = InterlockedCompareExchange(&session->transportSequence, 0, 0);
+                    LONG transCount = InterlockedCompareExchange(&session->transportFrameCount, 0, 0);
                     char msg[256];
                     sprintf_s(msg, sizeof(msg),
                         "FluxIdd: FRAME_DELIVERY_SUCCESS width=%u height=%u format=%u acquire=%lld released=%lld processed=%lld errors=%lld\n",
                         width, height, format, acq, rel, proc, err);
                     OutputDebugStringA(msg);
-                    WriteDiagnosticStatus("ACTIVE", width, height, format, acq, proc, rel, sig, err, 1, session->setDeviceHr, firstW, firstH);
+                    WriteDiagnosticStatus("ACTIVE", width, height, format, acq, proc, rel, sig, err, 1, session->setDeviceHr, firstW, firstH, transSeq, transCount);
                 }
             } else {
                 // Surface was invalid: frame lifecycle completed cleanly via FinishedProcessingFrame, now terminate loop
@@ -465,7 +625,9 @@ void FluxIddStopWorker(FluxMonitorContext* ctx) {
             LONG sdhr = InterlockedCompareExchange(&session->setDeviceHr, 0, 0);
             UINT firstW = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameWidth, 0, 0));
             UINT firstH = static_cast<UINT>(InterlockedCompareExchange(&session->firstFrameHeight, 0, 0));
-            WriteDiagnosticStatus("STOPPED", w, h, f, acq, proc, rel, sig, err, sdc, sdhr, firstW, firstH);
+            LONG transSeq = InterlockedCompareExchange(&session->transportSequence, 0, 0);
+            LONG transCount = InterlockedCompareExchange(&session->transportFrameCount, 0, 0);
+            WriteDiagnosticStatus("STOPPED", w, h, f, acq, proc, rel, sig, err, sdc, sdhr, firstW, firstH, transSeq, transCount);
 
             // Release the monitor's reference
             ReleaseSession(ctx->activeSession);
