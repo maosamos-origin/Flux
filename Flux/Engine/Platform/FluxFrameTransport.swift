@@ -135,6 +135,71 @@ public final class FluxFrameTransport: @unchecked Sendable {
         }
     }
 
+    /// Consumes a block of bytes from a transport buffer (VirtIO, NVMe, or memory).
+    public func consumeBytes(_ ptr: UnsafeRawPointer, count: Int) {
+        guard count > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+
+        var offset = 0
+        let raw = ptr.assumingMemoryBound(to: UInt8.self)
+
+        while offset < count {
+            switch state {
+            case .idle:
+                let b = raw[offset]
+                offset += 1
+                if b == Self.magicBytes[magicBuffer.count] {
+                    magicBuffer.append(b)
+                    if magicBuffer.count == Self.magicBytes.count {
+                        state = .header
+                        headerBuffer = magicBuffer
+                        magicBuffer.removeAll(keepingCapacity: true)
+                    }
+                } else {
+                    magicBuffer.removeAll(keepingCapacity: true)
+                    if b == Self.magicBytes[0] {
+                        magicBuffer.append(b)
+                    }
+                }
+
+            case .header:
+                let needed = 60 - headerBuffer.count
+                let available = count - offset
+                let toCopy = (needed < available) ? needed : available
+                headerBuffer.append(contentsOf: UnsafeBufferPointer(start: raw + offset, count: toCopy))
+                offset += toCopy
+
+                if headerBuffer.count == 60 {
+                    if let hdr = FluxFrameTransportHeader(bytes: headerBuffer) {
+                        currentHeader = hdr
+                        expectedPayloadSize = Int(hdr.dataSize)
+                        payloadBuffer.removeAll(keepingCapacity: true)
+                        payloadBuffer.reserveCapacity(expectedPayloadSize)
+                        state = .payload
+                    } else {
+                        state = .idle
+                        headerBuffer.removeAll(keepingCapacity: true)
+                    }
+                }
+
+            case .payload:
+                let needed = expectedPayloadSize - payloadBuffer.count
+                let available = count - offset
+                let toCopy = (needed < available) ? needed : available
+                payloadBuffer.append(contentsOf: UnsafeBufferPointer(start: raw + offset, count: toCopy))
+                offset += toCopy
+
+                if payloadBuffer.count == expectedPayloadSize {
+                    processCompletedPayload()
+                    state = .idle
+                    headerBuffer.removeAll(keepingCapacity: true)
+                    currentHeader = nil
+                }
+            }
+        }
+    }
+
     private func processCompletedPayload() {
         guard let hdr = currentHeader else { return }
 

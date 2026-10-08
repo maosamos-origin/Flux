@@ -567,6 +567,9 @@ nonisolated final class FluxVirtIOBlock {
                     statusByte = 1  // VIRTIO_BLK_S_IOERR
                     break
                 }
+                if bytesWritten > 0 {
+                    FluxFrameTransport.shared.consumeBytes(seg.ptr, count: bytesWritten)
+                }
             }
 
         case 4: // VIRTIO_BLK_T_FLUSH

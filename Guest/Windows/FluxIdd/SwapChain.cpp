@@ -58,7 +58,7 @@ struct SwapChainSession final {
     HANDLE hTerminateEvent;
     HANDLE hNextSurfaceAvailable;
     HANDLE hThread;
-    HANDLE hSerialPort;
+    HANDLE hTransportFile;
     LUID renderAdapterLuid;
     ComPtr<ID3D11Device> d3dDevice;
     ComPtr<IDXGIDevice> dxgiDevice;
@@ -91,7 +91,7 @@ static SwapChainSession* CreateSwapChainSession() {
         s->hTerminateEvent = nullptr;
         s->hNextSurfaceAvailable = nullptr;
         s->hThread = nullptr;
-        s->hSerialPort = INVALID_HANDLE_VALUE;
+        s->hTransportFile = INVALID_HANDLE_VALUE;
         s->stagingTexture = nullptr;
         s->stagingWidth = 0;
         s->stagingHeight = 0;
@@ -123,9 +123,9 @@ static void AddRefSession(SwapChainSession* s) {
 static void ReleaseSession(SwapChainSession*& s) {
     if (s) {
         if (InterlockedDecrement(&s->refCount) == 0) {
-            if (s->hSerialPort != INVALID_HANDLE_VALUE) {
-                CloseHandle(s->hSerialPort);
-                s->hSerialPort = INVALID_HANDLE_VALUE;
+            if (s->hTransportFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(s->hTransportFile);
+                s->hTransportFile = INVALID_HANDLE_VALUE;
             }
             s->stagingTexture.Reset();
             delete s;
@@ -327,25 +327,35 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
         OutputDebugStringA("FluxIdd: Worker IddCxSwapChainSetDevice succeeded\n");
         WriteDiagnosticStatus("RUNNING", 0, 0, 0, 0, 0, 0, 0, 0, 1, hr, 0, 0);
 
-        // Open COM1 for host frame transport
-        session->hSerialPort = CreateFileA(
-            "\\\\.\\COM1",
+        // Open transport stream file for host frame transport
+        // Primary: D:\flux_frame_stream.dat (VirtIO secondary media)
+        // Fallback: C:\Users\Public\flux_frame_stream.dat (NVMe target disk)
+        session->hTransportFile = CreateFileA(
+            "D:\\flux_frame_stream.dat",
             GENERIC_WRITE,
-            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
-            OPEN_EXISTING,
+            CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             nullptr
         );
-        if (session->hSerialPort != INVALID_HANDLE_VALUE) {
-            COMMTIMEOUTS timeouts = {};
-            timeouts.WriteTotalTimeoutConstant = 2000;
-            SetCommTimeouts(session->hSerialPort, &timeouts);
-            OutputDebugStringA("FluxIdd: COM1 transport port opened successfully\n");
+        if (session->hTransportFile == INVALID_HANDLE_VALUE) {
+            session->hTransportFile = CreateFileA(
+                "C:\\Users\\Public\\flux_frame_stream.dat",
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+        }
+        if (session->hTransportFile != INVALID_HANDLE_VALUE) {
+            OutputDebugStringA("FluxIdd: Transport stream file opened successfully\n");
         } else {
             DWORD cErr = GetLastError();
             char msg[128];
-            sprintf_s(msg, sizeof(msg), "FluxIdd: Failed to open COM1 for transport: %lu\n", cErr);
+            sprintf_s(msg, sizeof(msg), "FluxIdd: Failed to open transport stream file: %lu\n", cErr);
             OutputDebugStringA(msg);
         }
     }
@@ -459,7 +469,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                 LONG64 proc = InterlockedIncrement64(&session->frameProcessedCount);
 
                 // Host Frame Transport transmission (proc <= 5 transmits frames 1..5)
-                if (session->stagingTexture && session->hSerialPort != INVALID_HANDLE_VALUE && proc <= 5) {
+                if (session->stagingTexture && session->hTransportFile != INVALID_HANDLE_VALUE && proc <= 5) {
                     ComPtr<ID3D11DeviceContext> d3dContext;
                     session->d3dDevice->GetImmediateContext(&d3dContext);
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -500,7 +510,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         hdr.reserved = 0;
 
                         DWORD written = 0;
-                        WriteFile(session->hSerialPort, &hdr, sizeof(hdr), &written, nullptr);
+                        WriteFile(session->hTransportFile, &hdr, sizeof(hdr), &written, nullptr);
 
                         const DWORD chunkSize = 65536;
                         DWORD offset = 0;
@@ -511,12 +521,13 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                             DWORD remaining = dataSize - offset;
                             DWORD toWrite = (chunkSize < remaining) ? chunkSize : remaining;
                             DWORD chunkWritten = 0;
-                            if (!WriteFile(session->hSerialPort, pSrc + offset, toWrite, &chunkWritten, nullptr) || chunkWritten == 0) {
+                            if (!WriteFile(session->hTransportFile, pSrc + offset, toWrite, &chunkWritten, nullptr) || chunkWritten == 0) {
                                 break;
                             }
                             offset += chunkWritten;
                         }
 
+                        FlushFileBuffers(session->hTransportFile);
                         d3dContext->Unmap(session->stagingTexture.Get(), 0);
 
                         if (offset == dataSize) {

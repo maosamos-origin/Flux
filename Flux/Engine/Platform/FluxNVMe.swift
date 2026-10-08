@@ -1607,6 +1607,11 @@ nonisolated final class FluxNVMe {
             if req.fd >= 0 && !req.iovs.isEmpty {
                 var localIovs = req.iovs
                 _ = pwritev(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
+                for iov in req.iovs {
+                    if let base = iov.iov_base, iov.iov_len > 0 {
+                        FluxFrameTransport.shared.consumeBytes(base, count: iov.iov_len)
+                    }
+                }
             }
 
             statsLock.lock()
