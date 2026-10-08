@@ -39,6 +39,7 @@ struct SwapChainSession final {
     HANDLE hTerminateEvent;
     HANDLE hNextSurfaceAvailable;
     HANDLE hThread;
+    LUID renderAdapterLuid;
     ComPtr<ID3D11Device> d3dDevice;
     ComPtr<IDXGIDevice> dxgiDevice;
     volatile LONG64 frameAcquireCount;
@@ -47,6 +48,8 @@ struct SwapChainSession final {
     volatile LONG lastWidth;
     volatile LONG lastHeight;
     volatile LONG lastFormat;
+    volatile LONG setDeviceCalled;
+    volatile LONG setDeviceHr;
 };
 
 static SwapChainSession* CreateSwapChainSession() {
@@ -59,12 +62,15 @@ static SwapChainSession* CreateSwapChainSession() {
         s->hTerminateEvent = nullptr;
         s->hNextSurfaceAvailable = nullptr;
         s->hThread = nullptr;
+        s->renderAdapterLuid = {};
         s->frameAcquireCount = 0;
         s->frameProcessedCount = 0;
         s->frameProcessingErrorCount = 0;
         s->lastWidth = 0;
         s->lastHeight = 0;
         s->lastFormat = 0;
+        s->setDeviceCalled = 0;
+        s->setDeviceHr = 0;
     }
     return s;
 }
@@ -85,15 +91,18 @@ static void ReleaseSession(SwapChainSession*& s) {
 }
 
 static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UINT format,
-                                  LONG64 acq, LONG64 proc, LONG64 err) {
+                                  LONG64 acq, LONG64 proc, LONG64 err,
+                                  LONG setDeviceCalled = 0, LONG setDeviceHr = 0) {
     HANDLE hFile = CreateFileA("C:\\Users\\Public\\flux_swapchain_status.txt",
                                GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile != INVALID_HANDLE_VALUE) {
-        char buf[512];
+        char buf[768];
         int len = sprintf_s(buf, sizeof(buf),
             "SWAPCHAIN_ASSIGN_CALLED=YES\r\n"
             "SWAPCHAIN_WORKER_STARTED=YES\r\n"
+            "SET_DEVICE_CALLED=%s\r\n"
+            "SET_DEVICE_HR=0x%08X\r\n"
             "SURFACE_AVAILABLE_SIGNAL_SEEN=%s\r\n"
             "FRAME_ACQUIRE_SUCCESS=%s\r\n"
             "FRAME_ACQUIRE_COUNT=%lld\r\n"
@@ -108,6 +117,8 @@ static void WriteDiagnosticStatus(const char* state, UINT width, UINT height, UI
             "SWAPCHAIN_UNASSIGN_CALLED=%s\r\n"
             "SWAPCHAIN_WORKER_STOPPED=%s\r\n"
             "WORKER_STATE=%s\r\n",
+            setDeviceCalled ? "YES" : "NO",
+            static_cast<UINT>(setDeviceHr),
             proc > 0 ? "YES" : (acq > 0 ? "YES" : "WAITING"),
             acq > 0 ? "YES" : "NO",
             acq,
@@ -203,9 +214,59 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
         return 0;
     }
 
+    OutputDebugStringA("FluxIdd: FluxIddWorkerThread entered\n");
+
     IDDCX_SWAPCHAIN hSwapChain = session->hSwapChain;
     // hTerminateEvent placed at index 0 guarantees termination priority over hNextSurfaceAvailable at index 1
     HANDLE waitHandles[2] = { session->hTerminateEvent, session->hNextSurfaceAvailable };
+
+    // Priority Check 1: Explicit termination check before starting D3D setup
+    if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
+        OutputDebugStringA("FluxIdd: Worker detected termination priority signal before device creation\n");
+        goto Cleanup;
+    }
+
+    // 1. CreateRenderDevice(session->renderAdapterLuid, ...)
+    {
+        ComPtr<ID3D11Device> d3dDevice;
+        ComPtr<IDXGIDevice> dxgiDevice;
+        HRESULT hr = CreateRenderDevice(session->renderAdapterLuid, d3dDevice, dxgiDevice);
+        if (FAILED(hr)) {
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "FluxIdd: Worker CreateRenderDevice failed: 0x%08X\n", hr);
+            OutputDebugStringA(msg);
+            WriteDiagnosticStatus("DEVICE_CREATION_FAILED", 0, 0, 0, 0, 0, 1, 0, hr);
+            goto Cleanup;
+        }
+
+        session->d3dDevice = d3dDevice;
+        session->dxgiDevice = dxgiDevice;
+    }
+
+    // Priority Check 2: Check termination again before SetDevice
+    if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
+        OutputDebugStringA("FluxIdd: Worker detected termination priority signal before SetDevice\n");
+        goto Cleanup;
+    }
+
+    // 2. IddCxSwapChainSetDevice(session->hSwapChain, &setDevice)
+    {
+        IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
+        setDevice.pDevice = session->dxgiDevice.Get();
+        HRESULT hr = IddCxSwapChainSetDevice(hSwapChain, &setDevice);
+        InterlockedExchange(&session->setDeviceCalled, 1);
+        InterlockedExchange(&session->setDeviceHr, static_cast<LONG>(hr));
+
+        if (FAILED(hr)) {
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "FluxIdd: Worker IddCxSwapChainSetDevice failed: 0x%08X\n", hr);
+            OutputDebugStringA(msg);
+            WriteDiagnosticStatus("SET_DEVICE_FAILED", 0, 0, 0, 0, 0, 1, 1, hr);
+            goto Cleanup;
+        }
+        OutputDebugStringA("FluxIdd: Worker IddCxSwapChainSetDevice succeeded\n");
+        WriteDiagnosticStatus("RUNNING", 0, 0, 0, 0, 0, 0, 1, hr);
+    }
 
     for (;;) {
         // Priority Check 1: Explicit termination check before acquiring prevents starvation under continuous arrival
@@ -294,7 +355,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         "FluxIdd: FRAME_DELIVERY_SUCCESS width=%u height=%u format=%u acquire=%lld processed=%lld errors=%lld\n",
                         width, height, format, acq, proc, err);
                     OutputDebugStringA(msg);
-                    WriteDiagnosticStatus("ACTIVE", width, height, format, acq, proc, err);
+                    WriteDiagnosticStatus("ACTIVE", width, height, format, acq, proc, err, 1, session->setDeviceHr);
                 }
             } else {
                 // Surface was invalid: frame lifecycle completed cleanly via FinishedProcessingFrame, now terminate loop
@@ -310,6 +371,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
         }
     }
 
+Cleanup:
     // Delayed cleanup check: if StopWorker timed out, worker performs the delegated cleanup
     if (InterlockedCompareExchange(&session->cleanupDelegatedToWorker, 0, 0) == 1) {
         OutputDebugStringA("FluxIdd: Worker executing delegated resource cleanup post-timeout\n");
@@ -371,7 +433,9 @@ void FluxIddStopWorker(FluxMonitorContext* ctx) {
             LONG64 acq = InterlockedCompareExchange64(&session->frameAcquireCount, 0, 0);
             LONG64 proc = InterlockedCompareExchange64(&session->frameProcessedCount, 0, 0);
             LONG64 err = InterlockedCompareExchange64(&session->frameProcessingErrorCount, 0, 0);
-            WriteDiagnosticStatus("STOPPED", w, h, f, acq, proc, err);
+            LONG sdc = InterlockedCompareExchange(&session->setDeviceCalled, 0, 0);
+            LONG sdhr = InterlockedCompareExchange(&session->setDeviceHr, 0, 0);
+            WriteDiagnosticStatus("STOPPED", w, h, f, acq, proc, err, sdc, sdhr);
 
             // Release the monitor's reference
             ReleaseSession(ctx->activeSession);
@@ -418,37 +482,14 @@ NTSTATUS FluxIddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SET
         // A prior worker session is still active post-timeout; block replacement swapchain
         OutputDebugStringA("FluxIdd: Rejecting replacement swapchain: prior worker still active\n");
         WdfObjectDelete(args->hSwapChain);
-        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+        return STATUS_SUCCESS;
     }
-
-    ComPtr<ID3D11Device> d3dDevice;
-    ComPtr<IDXGIDevice> dxgiDevice;
-    HRESULT hr = CreateRenderDevice(args->RenderAdapterLuid, d3dDevice, dxgiDevice);
-    if (FAILED(hr)) {
-        char msg[128];
-        sprintf_s(msg, sizeof(msg), "FluxIdd: CreateRenderDevice failed: 0x%08X\n", hr);
-        OutputDebugStringA(msg);
-        WdfObjectDelete(args->hSwapChain);
-        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
-    }
-
-    IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
-    setDevice.pDevice = dxgiDevice.Get();
-    hr = IddCxSwapChainSetDevice(args->hSwapChain, &setDevice);
-    if (FAILED(hr)) {
-        char msg[128];
-        sprintf_s(msg, sizeof(msg), "FluxIdd: IddCxSwapChainSetDevice failed: 0x%08X\n", hr);
-        OutputDebugStringA(msg);
-        WdfObjectDelete(args->hSwapChain);
-        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
-    }
-    OutputDebugStringA("FluxIdd: IddCxSwapChainSetDevice succeeded\n");
 
     auto* session = CreateSwapChainSession();
     if (!session) {
         OutputDebugStringA("FluxIdd: Failed to allocate SwapChainSession\n");
         WdfObjectDelete(args->hSwapChain);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_SUCCESS;
     }
 
     session->hTerminateEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
@@ -456,13 +497,12 @@ NTSTATUS FluxIddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SET
         OutputDebugStringA("FluxIdd: CreateEvent failed for hTerminateEvent\n");
         ReleaseSession(session);
         WdfObjectDelete(args->hSwapChain);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_SUCCESS;
     }
 
     session->hSwapChain = args->hSwapChain;
     session->hNextSurfaceAvailable = args->hNextSurfaceAvailable;
-    session->d3dDevice = d3dDevice;
-    session->dxgiDevice = dxgiDevice;
+    session->renderAdapterLuid = args->RenderAdapterLuid;
 
     // Acquire worker thread reference (refCount = 2)
     AddRefSession(session);
@@ -476,14 +516,14 @@ NTSTATUS FluxIddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SET
         WdfObjectDelete(session->hSwapChain);
         session->hSwapChain = nullptr;
         ReleaseSession(session); // release monitor reference
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_SUCCESS;
     }
 
     session->hThread = hThread;
     ctx->activeSession = session;
 
     OutputDebugStringA("FluxIdd: SWAPCHAIN_WORKER_STARTED\n");
-    WriteDiagnosticStatus("RUNNING", 0, 0, 0, 0, 0, 0);
+    WriteDiagnosticStatus("STARTING", 0, 0, 0, 0, 0, 0, 0, 0);
 
     return STATUS_SUCCESS;
 }
