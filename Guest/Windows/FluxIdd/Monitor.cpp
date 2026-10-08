@@ -12,7 +12,14 @@ IDDCX_MONITOR_MODE FluxIddMakeMonitorMode(const FluxIddMode& mode) { IDDCX_MONIT
 IDDCX_TARGET_MODE FluxIddMakeTargetMode(const FluxIddMode& mode) { IDDCX_TARGET_MODE out = {}; out.Size = sizeof(out); FillSignalInfo(&out.TargetVideoSignalInfo.targetVideoSignalInfo, mode, false); return out; }
 NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
     OutputDebugStringA("FluxIdd: FluxIddCreateAndArriveMonitor entered\n");
-    WDF_OBJECT_ATTRIBUTES attributes; WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FluxMonitorContext);
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FluxMonitorContext);
+    attributes.EvtCleanupCallback = [](WDFOBJECT obj) {
+        auto* monCtx = FluxGetMonitorContext(obj);
+        if (monCtx) {
+            FluxIddStopWorker(monCtx);
+        }
+    };
     IDDCX_MONITOR_INFO monitorInfo = {}; monitorInfo.Size = sizeof(monitorInfo);
     monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
     monitorInfo.ConnectorIndex = 0;
@@ -33,7 +40,7 @@ NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter) {
     OutputDebugStringA("FluxIdd: IddCxMonitorCreate success\n");
     auto* monCtx = FluxGetMonitorContext(output.MonitorObject);
     monCtx->monitor = output.MonitorObject;
-    monCtx->swapChain = nullptr;
+    monCtx->activeSession = nullptr;
     IDARG_OUT_MONITORARRIVAL arrival = {};
     status = IddCxMonitorArrival(output.MonitorObject, &arrival);
     if (!NT_SUCCESS(status)) {

@@ -14,7 +14,8 @@ constexpr size_t kFluxIddModeCount = 2;
 
 struct FluxDeviceContext final { WDFDEVICE device; IDDCX_ADAPTER adapter; };
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FluxDeviceContext, FluxGetDeviceContext);
-struct FluxMonitorContext final { IDDCX_MONITOR monitor; IDDCX_SWAPCHAIN swapChain; };
+struct SwapChainSession;
+struct FluxMonitorContext final { IDDCX_MONITOR monitor; SwapChainSession* activeSession; };
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FluxMonitorContext, FluxGetMonitorContext);
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
@@ -32,3 +33,4 @@ NTSTATUS FluxIddInitializeAdapter(WDFDEVICE device);
 NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter);
 IDDCX_MONITOR_MODE FluxIddMakeMonitorMode(const FluxIddMode& mode);
 IDDCX_TARGET_MODE FluxIddMakeTargetMode(const FluxIddMode& mode);
+void FluxIddStopWorker(FluxMonitorContext* ctx);
