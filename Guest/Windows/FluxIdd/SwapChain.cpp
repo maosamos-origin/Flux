@@ -508,7 +508,8 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                             if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
                                 break;
                             }
-                            DWORD toWrite = min(chunkSize, dataSize - offset);
+                            DWORD remaining = dataSize - offset;
+                            DWORD toWrite = (chunkSize < remaining) ? chunkSize : remaining;
                             DWORD chunkWritten = 0;
                             if (!WriteFile(session->hSerialPort, pSrc + offset, toWrite, &chunkWritten, nullptr) || chunkWritten == 0) {
                                 break;
