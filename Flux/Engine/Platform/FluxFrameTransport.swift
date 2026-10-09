@@ -288,6 +288,50 @@ public final class FluxFrameTransport: @unchecked Sendable {
         writeStatusReport()
     }
 
+    // Render tracking fields
+    public private(set) var renderedFrameCount: Int = 0
+    public private(set) var lastRenderedSequence: UInt32 = 0
+    public private(set) var activeRenderSource: String = "NONE"
+
+    public func recordRenderedFrame(source: String, sequence: UInt32) {
+        lock.lock()
+        renderedFrameCount += 1
+        activeRenderSource = source
+        lastRenderedSequence = sequence
+        lock.unlock()
+    }
+
+    /// Safely copies the latest validated frame into destination pointer without heap allocation.
+    /// Returns frame metadata if a valid frame is ready, or nil if no valid frame exists.
+    public func copyLatestFrame(to dest: UnsafeMutableRawPointer, maxBytes: Int) -> (width: Int, height: Int, stride: Int, sequence: UInt32)? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let data = latestFrameData,
+              lastFrameValid,
+              lastWidth > 0,
+              lastHeight > 0,
+              maxBytes >= data.count else {
+            return nil
+        }
+
+        data.withUnsafeBytes { raw in
+            if let base = raw.baseAddress {
+                memcpy(dest, base, data.count)
+            }
+        }
+
+        return (Int(lastWidth), Int(lastHeight), Int(lastStride), lastSequence)
+    }
+
+    /// Provides access to the latest validated frame for screenshots.
+    public func latestFrameDataSnapshot() -> (data: Data, width: Int, height: Int, stride: Int, sequence: UInt32)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let data = latestFrameData, lastFrameValid, lastWidth > 0, lastHeight > 0 else { return nil }
+        return (data, Int(lastWidth), Int(lastHeight), Int(lastStride), lastSequence)
+    }
+
     /// Writes diagnostic report to disk for retrieval.
     public func writeStatusReport() {
         let appDir = FluxVM.defaultAppDirectory()
@@ -309,7 +353,10 @@ public final class FluxFrameTransport: @unchecked Sendable {
             "PIXEL_0=0x" + String(format: "%08X", lastPixel0),
             "PIXEL_CENTER=0x" + String(format: "%08X", lastPixelCenter),
             "PIXEL_LAST=0x" + String(format: "%08X", lastPixelLast),
-            "SEQUENCE_HISTORY=" + sequenceHistory.map { String($0) }.joined(separator: ",")
+            "SEQUENCE_HISTORY=" + sequenceHistory.map { String($0) }.joined(separator: ","),
+            "RENDERED_FRAME_COUNT=\(renderedFrameCount)",
+            "RENDERED_SOURCE=\(activeRenderSource)",
+            "LAST_RENDERED_SEQUENCE=\(lastRenderedSequence)"
         ]
 
         let content = lines.joined(separator: "\r\n") + "\r\n"
@@ -338,6 +385,9 @@ public final class FluxFrameTransport: @unchecked Sendable {
         PIXEL_CENTER=0x\(String(format: "%08X", lastPixelCenter))
         PIXEL_LAST=0x\(String(format: "%08X", lastPixelLast))
         SEQUENCE_HISTORY=\(sequenceHistory.map { String($0) }.joined(separator: ","))
+        RENDERED_FRAME_COUNT=\(renderedFrameCount)
+        RENDERED_SOURCE=\(activeRenderSource)
+        LAST_RENDERED_SEQUENCE=\(lastRenderedSequence)
         """
     }
 }

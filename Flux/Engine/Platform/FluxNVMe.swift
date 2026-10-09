@@ -1607,9 +1607,12 @@ nonisolated final class FluxNVMe {
                     _ = pwritev(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
                 }
                 // Verified designated channel for Frame Transport packets:
-                for iov in req.iovs {
-                    if let base = iov.iov_base, iov.iov_len > 0 {
-                        FluxFrameTransport.shared.consumeBytes(base, count: iov.iov_len)
+                // Only feed data cluster writes (>= 0x205000) to isolate filesystem metadata (FAT tables, directory, boot sector)
+                if req.fileOffset >= 0x205000 {
+                    for iov in req.iovs {
+                        if let base = iov.iov_base, iov.iov_len > 0 {
+                            FluxFrameTransport.shared.consumeBytes(base, count: iov.iov_len)
+                        }
                     }
                 }
                 completeIORequest(generation: req.generation, sqid: req.sqid, cqId: req.cqId, cid: req.cid, dw0: 0, status: 0)

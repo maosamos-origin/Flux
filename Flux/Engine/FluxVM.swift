@@ -600,6 +600,17 @@ nonisolated final class FluxVM {
     // MARK: - Framebuffer Screenshot Capture
 
     static func captureCurrentScreenshot(path: String? = nil) {
+        if let iddSnap = FluxFrameTransport.shared.latestFrameDataSnapshot() {
+            let width = iddSnap.width
+            let height = iddSnap.height
+            let stride = iddSnap.stride
+            iddSnap.data.withUnsafeBytes { raw in
+                if let base = raw.baseAddress {
+                    saveScreenshot(hostPtr: UnsafeMutableRawPointer(mutating: base), width: width, height: height, stride: stride, toPath: path)
+                }
+            }
+            return
+        }
         let snap = FluxFramebuffer.shared.snapshot()
         if snap.isConfigured, let hostPtr = snap.hostPointer, snap.width > 0, snap.height > 0 {
             saveScreenshot(hostPtr: hostPtr, width: snap.width, height: snap.height, stride: snap.stride, toPath: path)

@@ -50,31 +50,60 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
         // View size changed; Metal handles viewport scaling
     }
 
+    public private(set) var activeSource: String = "NONE"
+    public private(set) var renderedFrameCount: Int = 0
+    public private(set) var lastRenderedSequence: UInt32 = 0
+    private var lastLoggedSource: String = ""
+
     func draw(in view: MTKView) {
-        let snap = FluxFramebuffer.shared.snapshot()
-        guard snap.isConfigured,
-              let hostPtr = snap.hostPointer,
-              snap.width > 0,
-              snap.height > 0 else {
-            return
-        }
+        var width = 0
+        var height = 0
+        var stride = 0
+        var currentSource = "NONE"
+        var currentSequence: UInt32 = 0
 
-        let width = snap.width
-        let height = snap.height
-        let stride = snap.stride > 0 ? snap.stride : (width * 4)
-        let uploadSize = stride * height
-        guard uploadSize > 0 else { return }
-
-        // Guest RAM is a high-address Hypervisor mapping.  Metal's Debug
-        // capture layer does not accept it directly as a replaceRegion source,
-        // so stage the current frame in ordinary process-owned memory.
-        if uploadBufferSize != uploadSize {
+        // 1. Check for native FluxIdd Indirect Display frame first
+        let iddSize = 800 * 600 * 4
+        if uploadBufferSize < iddSize {
             uploadBuffer?.deallocate()
-            uploadBuffer = UnsafeMutableRawPointer.allocate(byteCount: uploadSize, alignment: 64)
-            uploadBufferSize = uploadSize
+            uploadBuffer = UnsafeMutableRawPointer.allocate(byteCount: iddSize, alignment: 64)
+            uploadBufferSize = iddSize
         }
-        guard let uploadBuffer else { return }
-        memcpy(uploadBuffer, hostPtr, uploadSize)
+
+        if let uploadBuffer = self.uploadBuffer,
+           let iddFrame = FluxFrameTransport.shared.copyLatestFrame(to: uploadBuffer, maxBytes: uploadBufferSize) {
+            width = iddFrame.width
+            height = iddFrame.height
+            stride = iddFrame.stride > 0 ? iddFrame.stride : (width * 4)
+            currentSource = "FluxIdd"
+            currentSequence = iddFrame.sequence
+        } else {
+            // 2. Fallback to firmware RAMFB when no valid FluxIdd frame is available
+            let snap = FluxFramebuffer.shared.snapshot()
+            guard snap.isConfigured,
+                  let hostPtr = snap.hostPointer,
+                  snap.width > 0,
+                  snap.height > 0 else {
+                return
+            }
+
+            width = snap.width
+            height = snap.height
+            stride = snap.stride > 0 ? snap.stride : (width * 4)
+            let uploadSize = stride * height
+            guard uploadSize > 0 else { return }
+
+            if uploadBufferSize < uploadSize {
+                self.uploadBuffer?.deallocate()
+                self.uploadBuffer = UnsafeMutableRawPointer.allocate(byteCount: uploadSize, alignment: 64)
+                self.uploadBufferSize = uploadSize
+            }
+            guard let uploadBuffer = self.uploadBuffer else { return }
+            memcpy(uploadBuffer, hostPtr, uploadSize)
+            currentSource = "RAMFB"
+        }
+
+        guard let uploadBuffer = self.uploadBuffer, width > 0, height > 0 else { return }
 
         // (Re)create texture if needed
         if texture == nil || texture?.width != width || texture?.height != height {
@@ -87,6 +116,7 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
             desc.storageMode = .shared
             desc.usage = [.shaderRead]
             self.texture = device.makeTexture(descriptor: desc)
+            print("🖥️ [FluxMetalRenderer] Created Metal texture \(width)x\(height) for source=\(currentSource)")
         }
 
         guard let texture = self.texture,
@@ -96,7 +126,7 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
             return
         }
 
-        // Upload guest framebuffer pixels into Metal texture
+        // Upload framebuffer pixels into Metal texture
         let region = MTLRegionMake2D(0, 0, width, height)
         texture.replace(region: region, mipmapLevel: 0, withBytes: uploadBuffer, bytesPerRow: stride)
 
@@ -149,5 +179,15 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
+
+        renderedFrameCount += 1
+        activeSource = currentSource
+        lastRenderedSequence = currentSequence
+        FluxFrameTransport.shared.recordRenderedFrame(source: currentSource, sequence: currentSequence)
+
+        if currentSource != lastLoggedSource {
+            lastLoggedSource = currentSource
+            print("🎬 [FluxMetalRenderer] Active display source switched to: \(currentSource) (\(width)x\(height), frame #\(renderedFrameCount))")
+        }
     }
 }
