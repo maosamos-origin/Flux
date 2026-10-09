@@ -190,6 +190,7 @@ extern "C" {
     DWORD __stdcall GetLastError(VOID);
     VOID __stdcall ExitProcess(unsigned int uExitCode);
     HANDLE __stdcall GetStdHandle(DWORD nStdHandle);
+    BOOL __stdcall SetStdHandle(DWORD nStdHandle, HANDLE hHandle);
     BOOL __stdcall WriteFile(HANDLE hFile, const void* lpBuffer, DWORD nNumberOfBytesToWrite, DWORD* lpNumberOfBytesWritten, void* lpOverlapped);
     DWORD __stdcall FormatMessageW(DWORD dwFlags, const void* lpSource, DWORD dwMessageId, DWORD dwLanguageId, wchar_t* lpBuffer, DWORD nSize, void* Arguments);
     VOID* __stdcall LocalFree(VOID* hMem);
@@ -821,6 +822,23 @@ bool RemoveDeviceInstance(const wchar_t* instanceId) {
 
 bool RunDaemon(const wchar_t* wantedHardwareId, const GUID& classGuid, DWORD durationSeconds) {
     (void)classGuid;
+    // The scheduled task runs without a console.  Preserve the daemon's
+    // diagnostics in the same durable log consumed by the verification tools.
+    // A failed log open must not prevent the device handle from being held.
+    HANDLE daemonLog = CreateFileW(
+        L"C:\\Users\\Public\\flux_daemon_out.txt",
+        0x0004 /* FILE_APPEND_DATA */,
+        0x00000001 | 0x00000002 /* FILE_SHARE_READ | FILE_SHARE_WRITE */,
+        nullptr,
+        4 /* OPEN_ALWAYS */,
+        0x00000080 /* FILE_ATTRIBUTE_NORMAL */,
+        nullptr
+    );
+    if (daemonLog != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_OUTPUT_HANDLE, daemonLog);
+        SetStdHandle(STD_ERROR_HANDLE, daemonLog);
+    }
+
     // 1. Single-instance mutex
     HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"Local\\FluxDevNodeDaemonMutex");
     if (!hMutex) {

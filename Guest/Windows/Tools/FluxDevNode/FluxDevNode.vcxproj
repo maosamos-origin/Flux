@@ -32,6 +32,10 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
+      <!-- The boot-persistent daemon must never create a user-visible console. -->
+      <SubSystem>Windows</SubSystem>
+      <!-- Keep the existing Unicode command-line entry point when using the GUI subsystem. -->
+      <EntryPointSymbol>wmainCRTStartup</EntryPointSymbol>
       <AdditionalDependencies>swdevice.lib;cfgmgr32.lib;setupapi.lib;ole32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
