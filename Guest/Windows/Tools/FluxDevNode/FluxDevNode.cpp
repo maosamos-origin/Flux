@@ -64,6 +64,16 @@ typedef struct _devicemodew {
     DWORD dmPanningWidth;
     DWORD dmPanningHeight;
 } DEVMODEW;
+
+typedef struct _DISPLAY_DEVICEW {
+    DWORD cb;
+    WCHAR DeviceName[32];
+    WCHAR DeviceString[128];
+    DWORD StateFlags;
+    WCHAR DeviceID[128];
+    WCHAR DeviceKey[128];
+} DISPLAY_DEVICEW, *PDISPLAY_DEVICEW;
+
 typedef struct _GUID {
     unsigned long  Data1;
     unsigned short Data2;
@@ -213,6 +223,11 @@ extern "C" {
     HRESULT __stdcall CLSIDFromString(PCWSTR lpsz, GUID* pclsid);
     wchar_t** __stdcall CommandLineToArgvW(PCWSTR lpCmdLine, int* pNumArgs);
     PCWSTR __stdcall GetCommandLineW(VOID);
+
+    BOOL __stdcall EnumDisplayDevicesW(PCWSTR lpDevice, DWORD iDevNum, DISPLAY_DEVICEW* lpDisplayDevice, DWORD dwFlags);
+    BOOL __stdcall EnumDisplaySettingsW(PCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW* lpDevMode);
+    LONG __stdcall ChangeDisplaySettingsExW(PCWSTR lpszDeviceName, DEVMODEW* lpDevMode, void* hwnd, DWORD dwflags, void* lParam);
+    LONG __stdcall ChangeDisplaySettingsW(DEVMODEW* lpDevMode, DWORD dwflags);
 }
 #endif
 
@@ -1063,37 +1078,6 @@ bool StopDaemon() {
 }
 
 LONG SetResolution(DWORD width, DWORD height, const wchar_t* explicitDeviceName = nullptr) {
-    HMODULE hUser32 = LoadLibraryW(L"user32.dll");
-    if (!hUser32) {
-        PrintWin32Failure(L"LoadLibrary(user32.dll)", GetLastError());
-        return -1;
-    }
-
-    typedef struct _DISPLAY_DEVICEW {
-        DWORD cb;
-        WCHAR DeviceName[32];
-        WCHAR DeviceString[128];
-        DWORD StateFlags;
-        WCHAR DeviceID[128];
-        WCHAR DeviceKey[128];
-    } DISPLAY_DEVICEW;
-
-    typedef BOOL (WINAPI *PFN_EnumDisplayDevicesW)(PCWSTR lpDevice, DWORD iDevNum, DISPLAY_DEVICEW* lpDisplayDevice, DWORD dwFlags);
-    typedef BOOL (WINAPI *PFN_EnumDisplaySettingsW)(PCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW* lpDevMode);
-    typedef LONG (WINAPI *PFN_ChangeDisplaySettingsExW)(PCWSTR lpszDeviceName, DEVMODEW* lpDevMode, void* hwnd, DWORD dwflags, void* lParam);
-    typedef LONG (WINAPI *PFN_ChangeDisplaySettingsW)(DEVMODEW* lpDevMode, DWORD dwflags);
-
-    auto pfnEnumDisplayDevicesW = reinterpret_cast<PFN_EnumDisplayDevicesW>(GetProcAddress(hUser32, "EnumDisplayDevicesW"));
-    auto pfnEnumDisplaySettingsW = reinterpret_cast<PFN_EnumDisplaySettingsW>(GetProcAddress(hUser32, "EnumDisplaySettingsW"));
-    auto pfnChangeDisplaySettingsExW = reinterpret_cast<PFN_ChangeDisplaySettingsExW>(GetProcAddress(hUser32, "ChangeDisplaySettingsExW"));
-    auto pfnChangeDisplaySettingsW = reinterpret_cast<PFN_ChangeDisplaySettingsW>(GetProcAddress(hUser32, "ChangeDisplaySettingsW"));
-
-    if (!pfnChangeDisplaySettingsExW && !pfnChangeDisplaySettingsW) {
-        ErrLine(L"ChangeDisplaySettings APIs not found in user32.dll");
-        FreeLibrary(hUser32);
-        return -1;
-    }
-
     WCHAR targetDevice[32] = {};
     DEVMODEW targetDm = {};
     bool haveTarget = false;
@@ -1104,10 +1088,10 @@ LONG SetResolution(DWORD width, DWORD height, const wchar_t* explicitDeviceName 
         for (unsigned long c = 0; c < elen; ++c) targetDevice[c] = explicitDeviceName[c];
         targetDevice[elen] = L'\0';
         haveTarget = true;
-    } else if (pfnEnumDisplayDevicesW) {
+    } else {
         DISPLAY_DEVICEW dd = {};
         dd.cb = sizeof(dd);
-        for (DWORD i = 0; pfnEnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
             bool isFlux = (StrContainsIC(dd.DeviceString, L"Flux") ||
                            StrContainsIC(dd.DeviceID, L"FLUX") ||
                            StrContainsIC(dd.DeviceID, L"SWD\\"));
@@ -1115,12 +1099,10 @@ LONG SetResolution(DWORD width, DWORD height, const wchar_t* explicitDeviceName 
             bool modeSupported = false;
             DEVMODEW dmMode = {};
             dmMode.dmSize = sizeof(dmMode);
-            if (pfnEnumDisplaySettingsW) {
-                for (DWORD m = 0; pfnEnumDisplaySettingsW(dd.DeviceName, m, &dmMode); ++m) {
-                    if (dmMode.dmPelsWidth == width && dmMode.dmPelsHeight == height) {
-                        modeSupported = true;
-                        break;
-                    }
+            for (DWORD m = 0; EnumDisplaySettingsW(dd.DeviceName, m, &dmMode); ++m) {
+                if (dmMode.dmPelsWidth == width && dmMode.dmPelsHeight == height) {
+                    modeSupported = true;
+                    break;
                 }
             }
 
@@ -1160,35 +1142,34 @@ LONG SetResolution(DWORD width, DWORD height, const wchar_t* explicitDeviceName 
 
     LONG result = -1;
 
-    if (haveTarget && pfnChangeDisplaySettingsExW) {
+    if (haveTarget) {
         Out(L"TARGET_DEVICE="); OutLine(targetDevice);
         targetDm.dmSize = sizeof(targetDm);
         targetDm.dmPelsWidth = width;
         targetDm.dmPelsHeight = height;
         targetDm.dmFields |= (0x00080000L | 0x00100000L); // DM_PELSWIDTH | DM_PELSHEIGHT
 
-        result = pfnChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0, nullptr);
+        result = ChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0, nullptr);
         Out(L"CHANGE_EX_0_RESULT="); OutDec(L"", (DWORD)result);
 
         if (result == 0) {
-            pfnChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0x00000001 | 0x00000008, nullptr);
+            ChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0x00000001 | 0x00000008, nullptr);
         } else {
-            result = pfnChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0x00000001, nullptr);
+            result = ChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0x00000001, nullptr);
             Out(L"CHANGE_EX_REG_RESULT="); OutDec(L"", (DWORD)result);
         }
     }
 
-    if (result != 0 && pfnChangeDisplaySettingsW) {
+    if (result != 0) {
         DEVMODEW dmDefault = {};
         dmDefault.dmSize = sizeof(dmDefault);
         dmDefault.dmPelsWidth = width;
         dmDefault.dmPelsHeight = height;
         dmDefault.dmFields = 0x00080000L | 0x00100000L;
-        result = pfnChangeDisplaySettingsW(&dmDefault, 0);
+        result = ChangeDisplaySettingsW(&dmDefault, 0);
         Out(L"CHANGE_DEFAULT_RESULT="); OutDec(L"", (DWORD)result);
     }
 
-    FreeLibrary(hUser32);
     return result;
 }
 
