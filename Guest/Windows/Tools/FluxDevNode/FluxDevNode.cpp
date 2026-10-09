@@ -380,6 +380,25 @@ bool StrStartsWith(const wchar_t* str, const wchar_t* prefix) {
     return true;
 }
 
+bool StrContainsIC(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle) return false;
+    unsigned long nlen = StrLen(needle);
+    if (nlen == 0) return true;
+    for (unsigned long i = 0; haystack[i] != L'\0'; ++i) {
+        bool match = true;
+        for (unsigned long j = 0; j < nlen; ++j) {
+            if (haystack[i + j] == L'\0') { match = false; break; }
+            wchar_t c1 = haystack[i + j];
+            wchar_t c2 = needle[j];
+            if (c1 >= L'A' && c1 <= L'Z') c1 = static_cast<wchar_t>(c1 + (L'a' - L'A'));
+            if (c2 >= L'A' && c2 <= L'Z') c2 = static_cast<wchar_t>(c2 + (L'a' - L'A'));
+            if (c1 != c2) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 DWORD ParseDec(const wchar_t* s) {
     if (!s) return 0;
     DWORD val = 0;
@@ -1043,27 +1062,132 @@ bool StopDaemon() {
     return true;
 }
 
-LONG SetResolution(DWORD width, DWORD height) {
+LONG SetResolution(DWORD width, DWORD height, const wchar_t* explicitDeviceName = nullptr) {
     HMODULE hUser32 = LoadLibraryW(L"user32.dll");
     if (!hUser32) {
         PrintWin32Failure(L"LoadLibrary(user32.dll)", GetLastError());
         return -1;
     }
+
+    typedef struct _DISPLAY_DEVICEW {
+        DWORD cb;
+        WCHAR DeviceName[32];
+        WCHAR DeviceString[128];
+        DWORD StateFlags;
+        WCHAR DeviceID[128];
+        WCHAR DeviceKey[128];
+    } DISPLAY_DEVICEW;
+
+    typedef BOOL (WINAPI *PFN_EnumDisplayDevicesW)(PCWSTR lpDevice, DWORD iDevNum, DISPLAY_DEVICEW* lpDisplayDevice, DWORD dwFlags);
+    typedef BOOL (WINAPI *PFN_EnumDisplaySettingsW)(PCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW* lpDevMode);
+    typedef LONG (WINAPI *PFN_ChangeDisplaySettingsExW)(PCWSTR lpszDeviceName, DEVMODEW* lpDevMode, void* hwnd, DWORD dwflags, void* lParam);
     typedef LONG (WINAPI *PFN_ChangeDisplaySettingsW)(DEVMODEW* lpDevMode, DWORD dwflags);
+
+    auto pfnEnumDisplayDevicesW = reinterpret_cast<PFN_EnumDisplayDevicesW>(GetProcAddress(hUser32, "EnumDisplayDevicesW"));
+    auto pfnEnumDisplaySettingsW = reinterpret_cast<PFN_EnumDisplaySettingsW>(GetProcAddress(hUser32, "EnumDisplaySettingsW"));
+    auto pfnChangeDisplaySettingsExW = reinterpret_cast<PFN_ChangeDisplaySettingsExW>(GetProcAddress(hUser32, "ChangeDisplaySettingsExW"));
     auto pfnChangeDisplaySettingsW = reinterpret_cast<PFN_ChangeDisplaySettingsW>(GetProcAddress(hUser32, "ChangeDisplaySettingsW"));
-    if (!pfnChangeDisplaySettingsW) {
-        ErrLine(L"ChangeDisplaySettingsW not found in user32.dll");
+
+    if (!pfnChangeDisplaySettingsExW && !pfnChangeDisplaySettingsW) {
+        ErrLine(L"ChangeDisplaySettings APIs not found in user32.dll");
         FreeLibrary(hUser32);
         return -1;
     }
 
-    DEVMODEW dm = {};
-    dm.dmSize = sizeof(dm);
-    dm.dmPelsWidth = width;
-    dm.dmPelsHeight = height;
-    dm.dmFields = 0x00080000L | 0x00100000L; // DM_PELSWIDTH | DM_PELSHEIGHT
+    WCHAR targetDevice[32] = {};
+    DEVMODEW targetDm = {};
+    bool haveTarget = false;
 
-    LONG result = pfnChangeDisplaySettingsW(&dm, 0);
+    if (explicitDeviceName && explicitDeviceName[0] != L'\0') {
+        unsigned long elen = StrLen(explicitDeviceName);
+        if (elen > 31) elen = 31;
+        for (unsigned long c = 0; c < elen; ++c) targetDevice[c] = explicitDeviceName[c];
+        targetDevice[elen] = L'\0';
+        haveTarget = true;
+    } else if (pfnEnumDisplayDevicesW) {
+        DISPLAY_DEVICEW dd = {};
+        dd.cb = sizeof(dd);
+        for (DWORD i = 0; pfnEnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+            bool isFlux = (StrContainsIC(dd.DeviceString, L"Flux") ||
+                           StrContainsIC(dd.DeviceID, L"FLUX") ||
+                           StrContainsIC(dd.DeviceID, L"SWD\\"));
+
+            bool modeSupported = false;
+            DEVMODEW dmMode = {};
+            dmMode.dmSize = sizeof(dmMode);
+            if (pfnEnumDisplaySettingsW) {
+                for (DWORD m = 0; pfnEnumDisplaySettingsW(dd.DeviceName, m, &dmMode); ++m) {
+                    if (dmMode.dmPelsWidth == width && dmMode.dmPelsHeight == height) {
+                        modeSupported = true;
+                        break;
+                    }
+                }
+            }
+
+            Out(L"DEV["); OutDec(L"", i); Out(L"]: Name="); Out(dd.DeviceName);
+            Out(L" Desc="); Out(dd.DeviceString);
+            Out(L" Flux="); Out(isFlux ? L"YES" : L"NO");
+            Out(L" ModeMatch="); OutLine(modeSupported ? L"YES" : L"NO");
+
+            // Priority: isFlux && modeSupported > modeSupported > isFlux
+            if (isFlux && modeSupported && !haveTarget) {
+                unsigned long l = StrLen(dd.DeviceName);
+                if (l > 31) l = 31;
+                for (unsigned long c = 0; c < l; ++c) targetDevice[c] = dd.DeviceName[c];
+                targetDevice[l] = L'\0';
+                targetDm = dmMode;
+                haveTarget = true;
+            } else if (modeSupported && !haveTarget) {
+                unsigned long l = StrLen(dd.DeviceName);
+                if (l > 31) l = 31;
+                for (unsigned long c = 0; c < l; ++c) targetDevice[c] = dd.DeviceName[c];
+                targetDevice[l] = L'\0';
+                targetDm = dmMode;
+                haveTarget = true;
+            } else if (isFlux && !haveTarget) {
+                unsigned long l = StrLen(dd.DeviceName);
+                if (l > 31) l = 31;
+                for (unsigned long c = 0; c < l; ++c) targetDevice[c] = dd.DeviceName[c];
+                targetDevice[l] = L'\0';
+                targetDm.dmSize = sizeof(targetDm);
+                targetDm.dmPelsWidth = width;
+                targetDm.dmPelsHeight = height;
+                targetDm.dmFields = 0x00080000L | 0x00100000L;
+                haveTarget = true;
+            }
+        }
+    }
+
+    LONG result = -1;
+
+    if (haveTarget && pfnChangeDisplaySettingsExW) {
+        Out(L"TARGET_DEVICE="); OutLine(targetDevice);
+        targetDm.dmSize = sizeof(targetDm);
+        targetDm.dmPelsWidth = width;
+        targetDm.dmPelsHeight = height;
+        targetDm.dmFields |= (0x00080000L | 0x00100000L); // DM_PELSWIDTH | DM_PELSHEIGHT
+
+        result = pfnChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0, nullptr);
+        Out(L"CHANGE_EX_0_RESULT="); OutDec(L"", (DWORD)result);
+
+        if (result == 0) {
+            pfnChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0x00000001 | 0x00000008, nullptr);
+        } else {
+            result = pfnChangeDisplaySettingsExW(targetDevice, &targetDm, nullptr, 0x00000001, nullptr);
+            Out(L"CHANGE_EX_REG_RESULT="); OutDec(L"", (DWORD)result);
+        }
+    }
+
+    if (result != 0 && pfnChangeDisplaySettingsW) {
+        DEVMODEW dmDefault = {};
+        dmDefault.dmSize = sizeof(dmDefault);
+        dmDefault.dmPelsWidth = width;
+        dmDefault.dmPelsHeight = height;
+        dmDefault.dmFields = 0x00080000L | 0x00100000L;
+        result = pfnChangeDisplaySettingsW(&dmDefault, 0);
+        Out(L"CHANGE_DEFAULT_RESULT="); OutDec(L"", (DWORD)result);
+    }
+
     FreeLibrary(hUser32);
     return result;
 }
@@ -1232,16 +1356,17 @@ int wmain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
-    if (argc == 4 && StrICmp(argv[1], L"setres") == 0) {
+    if ((argc == 4 || argc == 5) && StrICmp(argv[1], L"setres") == 0) {
         DWORD width = ParseDec(argv[2]);
         DWORD height = ParseDec(argv[3]);
+        const wchar_t* devName = (argc >= 5) ? argv[4] : nullptr;
         if (width == 0 || height == 0) {
             ErrLine(L"Invalid resolution parameters");
             return 2;
         }
         Out(L"REQUESTED_WIDTH="); OutDec(L"", width);
         Out(L"REQUESTED_HEIGHT="); OutDec(L"", height);
-        LONG res = SetResolution(width, height);
+        LONG res = SetResolution(width, height, devName);
         Out(L"CHANGE_DISPLAY_SETTINGS_RESULT=");
         if (res == 0) {
             OutLine(L"DISP_CHANGE_SUCCESSFUL (0)");

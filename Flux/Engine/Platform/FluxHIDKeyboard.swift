@@ -1060,25 +1060,37 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         Thread.sleep(forTimeInterval: 4.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-launched.bmp")
 
-        // Approve UAC consent dialog via Alt+Y:
-        print("[MILESTONE3] Approving UAC consent dialog via Alt+Y...")
-        handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
-        Thread.sleep(forTimeInterval: 0.15)
-        handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
-        Thread.sleep(forTimeInterval: 0.15)
-        handleKeyUp(keyCode: 0x10) // Y up
-        Thread.sleep(forTimeInterval: 0.15)
-        handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
-        Thread.sleep(forTimeInterval: 0.5)
+        // Approve UAC consent dialog: multi-vector approach (mouse click + Left Arrow/Enter + Alt+Y)
+        for attempt in 1...3 {
+            print("[MILESTONE3] UAC consent approval attempt \(attempt)...")
+            // 1. Pointer click on Yes button center
+            FluxHIDPointer.shared.updatePosition(x: 12042, y: 24357)
+            Thread.sleep(forTimeInterval: 0.2)
+            FluxHIDPointer.shared.updateButtons(0x01)
+            Thread.sleep(forTimeInterval: 0.1)
+            FluxHIDPointer.shared.updateButtons(0x00)
+            Thread.sleep(forTimeInterval: 0.2)
 
-        // Second Alt+Y in case the first was during secure desktop transition
-        handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
-        Thread.sleep(forTimeInterval: 0.15)
-        handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
-        Thread.sleep(forTimeInterval: 0.15)
-        handleKeyUp(keyCode: 0x10) // Y up
-        Thread.sleep(forTimeInterval: 0.15)
-        handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+            // 2. Left Arrow (moves focus from No to Yes) + Enter
+            handleKeyDown(keyCode: 0x7B, isRepeat: false)
+            Thread.sleep(forTimeInterval: 0.1)
+            handleKeyUp(keyCode: 0x7B)
+            Thread.sleep(forTimeInterval: 0.2)
+            handleKeyDown(keyCode: 0x24, isRepeat: false)
+            Thread.sleep(forTimeInterval: 0.1)
+            handleKeyUp(keyCode: 0x24)
+            Thread.sleep(forTimeInterval: 0.2)
+
+            // 3. Alt+Y accelerator
+            handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
+            Thread.sleep(forTimeInterval: 0.15)
+            handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
+            Thread.sleep(forTimeInterval: 0.15)
+            handleKeyUp(keyCode: 0x10) // Y up
+            Thread.sleep(forTimeInterval: 0.15)
+            handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+            Thread.sleep(forTimeInterval: 1.0)
+        }
 
         print("[MILESTONE3] UAC approvals dispatched. Waiting for driver update & multi-mode tests...")
 
