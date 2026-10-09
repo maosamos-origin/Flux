@@ -1,5 +1,10 @@
 #include "FluxIdd.h"
-const FluxIddMode kFluxIddModes[2] = { {800, 600, 60}, {1280, 720, 60} };
+const FluxIddMode kFluxIddModes[kFluxIddModeCount] = {
+    { 800,  600, 60},
+    {1280,  720, 60},
+    {1600,  900, 60},
+    {1920, 1080, 60}
+};
 static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* signal, const FluxIddMode& mode, bool monitorMode) {
     signal->totalSize.cx = signal->activeSize.cx = mode.width; signal->totalSize.cy = signal->activeSize.cy = mode.height;
     signal->AdditionalSignalInfo.vSyncFreqDivider = monitorMode ? 0 : 1; signal->AdditionalSignalInfo.videoStandard = 255;

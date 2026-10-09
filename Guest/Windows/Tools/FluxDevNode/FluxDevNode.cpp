@@ -8,6 +8,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "swdevice.lib")
+#pragma comment(lib, "user32.lib")
 #else
 typedef void* HANDLE;
 typedef void* HMODULE;
@@ -23,8 +24,46 @@ typedef const wchar_t* PCZZWSTR;
 typedef void* PVOID;
 typedef void VOID;
 typedef long HRESULT;
+typedef long LONG;
 #define TRUE 1
 #define FALSE 0
+
+typedef struct _devicemodew {
+    WCHAR dmDeviceName[32];
+    unsigned short dmSpecVersion;
+    unsigned short dmDriverVersion;
+    unsigned short dmSize;
+    unsigned short dmDriverExtra;
+    DWORD dmFields;
+    short dmOrientation;
+    short dmPaperSize;
+    short dmPaperLength;
+    short dmPaperWidth;
+    short dmScale;
+    short dmCopies;
+    short dmDefaultSource;
+    short dmPrintQuality;
+    short dmColor;
+    short dmDuplex;
+    short dmYResolution;
+    short dmTTOption;
+    short dmCollate;
+    WCHAR dmFormName[32];
+    unsigned short dmLogPixels;
+    DWORD dmBitsPerPel;
+    DWORD dmPelsWidth;
+    DWORD dmPelsHeight;
+    DWORD dmDisplayFlags;
+    DWORD dmDisplayFrequency;
+    DWORD dmICMMethod;
+    DWORD dmICMIntent;
+    DWORD dmMediaType;
+    DWORD dmDitherType;
+    DWORD dmReserved1;
+    DWORD dmReserved2;
+    DWORD dmPanningWidth;
+    DWORD dmPanningHeight;
+} DEVMODEW;
 typedef struct _GUID {
     unsigned long  Data1;
     unsigned short Data2;
@@ -156,6 +195,9 @@ extern "C" {
     HMODULE __stdcall LoadLibraryW(PCWSTR lpLibFileName);
     void* __stdcall GetProcAddress(HMODULE hModule, const char* lpProcName);
     BOOL __stdcall FreeLibrary(HMODULE hLibModule);
+    HANDLE __stdcall CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+    BOOL __stdcall ReadFile(HANDLE hFile, void* lpBuffer, DWORD nNumberOfBytesToRead, DWORD* lpNumberOfBytesRead, void* lpOverlapped);
+    BOOL __stdcall DeleteFileW(PCWSTR lpFileName);
 
     HDEVINFO __stdcall SetupDiGetClassDevsW(const GUID* ClassGuid, PCWSTR Enumerator, HANDLE hwndParent, DWORD Flags);
     BOOL __stdcall SetupDiEnumDeviceInfo(HDEVINFO DeviceInfoSet, DWORD MemberIndex, PSP_DEVINFO_DATA DeviceInfoData);
@@ -1001,6 +1043,157 @@ bool StopDaemon() {
     return true;
 }
 
+LONG SetResolution(DWORD width, DWORD height) {
+    HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+    if (!hUser32) {
+        PrintWin32Failure(L"LoadLibrary(user32.dll)", GetLastError());
+        return -1;
+    }
+    typedef LONG (WINAPI *PFN_ChangeDisplaySettingsW)(DEVMODEW* lpDevMode, DWORD dwflags);
+    auto pfnChangeDisplaySettingsW = reinterpret_cast<PFN_ChangeDisplaySettingsW>(GetProcAddress(hUser32, "ChangeDisplaySettingsW"));
+    if (!pfnChangeDisplaySettingsW) {
+        ErrLine(L"ChangeDisplaySettingsW not found in user32.dll");
+        FreeLibrary(hUser32);
+        return -1;
+    }
+
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    dm.dmPelsWidth = width;
+    dm.dmPelsHeight = height;
+    dm.dmFields = 0x00080000L | 0x00100000L; // DM_PELSWIDTH | DM_PELSHEIGHT
+
+    LONG result = pfnChangeDisplaySettingsW(&dm, 0);
+    FreeLibrary(hUser32);
+    return result;
+}
+
+bool RunResAgent(const wchar_t* requestPath, DWORD pollIntervalMs) {
+    if (!requestPath || requestPath[0] == L'\0') {
+        requestPath = L"D:\\flux_resolution_request.txt";
+    }
+    if (pollIntervalMs == 0) {
+        pollIntervalMs = 250;
+    }
+
+    HANDLE hStopEvent = CreateEventW(nullptr, TRUE, FALSE, L"Local\\FluxResAgentStopEvent");
+    if (!hStopEvent) {
+        PrintWin32Failure(L"CreateEventW(resagent-stop)", GetLastError());
+        return false;
+    }
+    ResetEvent(hStopEvent);
+
+    Out(L"RESAGENT_REQUEST_PATH="); OutLine(requestPath);
+    OutDec(L"RESAGENT_POLL_INTERVAL_MS=", pollIntervalMs);
+    OutLine(L"RESAGENT_STATUS=RUNNING");
+
+    DWORD elapsedMs = 0;
+    while (true) {
+        DWORD wr = WaitForSingleObject(hStopEvent, pollIntervalMs);
+        if (wr == 0) { // WAIT_OBJECT_0
+            OutLine(L"RESAGENT_STOP_REASON=STOP_SIGNALED");
+            break;
+        }
+
+        elapsedMs += pollIntervalMs;
+        if (elapsedMs % 30000 < pollIntervalMs) {
+            OutDec(L"RESAGENT_HEARTBEAT_SEC=", elapsedMs / 1000);
+        }
+
+        // Check primary request path, fallback to Public if not found
+        const wchar_t* activePath = requestPath;
+        HANDLE hFile = CreateFileW(activePath, 0x80000000L /* GENERIC_READ */, 0x00000001 | 0x00000002 /* FILE_SHARE_READ | FILE_SHARE_WRITE */,
+                                   nullptr, 3 /* OPEN_EXISTING */, 0x00000080 /* FILE_ATTRIBUTE_NORMAL */, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            activePath = L"C:\\Users\\Public\\flux_resolution_request.txt";
+            hFile = CreateFileW(activePath, 0x80000000L, 0x00000001 | 0x00000002,
+                                nullptr, 3, 0x00000080, nullptr);
+        }
+
+        if (hFile != INVALID_HANDLE_VALUE) {
+            char buf[256] = {};
+            DWORD bytesRead = 0;
+            ReadFile(hFile, buf, sizeof(buf) - 1, &bytesRead, nullptr);
+            CloseHandle(hFile);
+
+            // Delete request file once read
+            DeleteFileW(activePath);
+
+            if (bytesRead > 0) {
+                buf[bytesRead] = '\0';
+                DWORD w = 0, h = 0;
+                int i = 0;
+                while (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n') i++;
+                while (buf[i] >= '0' && buf[i] <= '9') { w = w * 10 + (buf[i] - '0'); i++; }
+                while (buf[i] == ' ' || buf[i] == '\t' || buf[i] == 'x' || buf[i] == 'X') i++;
+                while (buf[i] >= '0' && buf[i] <= '9') { h = h * 10 + (buf[i] - '0'); i++; }
+
+                if (w > 0 && h > 0) {
+                    Out(L"RESAGENT_RECEIVED_MODE="); OutDec(L"", w); Out(L"x"); OutDec(L"", h);
+                    LONG res = SetResolution(w, h);
+                    Out(L"RESAGENT_SET_RESULT=");
+                    if (res == 0) {
+                        OutLine(L"SUCCESS");
+                    } else {
+                        OutDec(L"FAIL_CODE=", static_cast<DWORD>(res));
+                    }
+
+                    // Write status file
+                    HANDLE hStatus = CreateFileW(L"D:\\flux_resolution_status.txt", 0x40000000L /* GENERIC_WRITE */, 0x00000001,
+                                                 nullptr, 2 /* CREATE_ALWAYS */, 0x00000080, nullptr);
+                    if (hStatus == INVALID_HANDLE_VALUE) {
+                        hStatus = CreateFileW(L"C:\\Users\\Public\\flux_resolution_status.txt", 0x40000000L, 0x00000001,
+                                              nullptr, 2, 0x00000080, nullptr);
+                    }
+                    if (hStatus != INVALID_HANDLE_VALUE) {
+                        char statusBuf[256];
+                        int slen = 0;
+                        const char* sStr = (res == 0) ? "SUCCESS" : "FAILED";
+                        char numW[16], numH[16], numC[16];
+                        int niw = 0, nih = 0, nic = 0;
+                        DWORD tw = w, th = h, tc = static_cast<DWORD>(res);
+                        if (tw == 0) numW[niw++] = '0'; else while (tw > 0) { numW[niw++] = '0' + (tw % 10); tw /= 10; }
+                        if (th == 0) numH[nih++] = '0'; else while (th > 0) { numH[nih++] = '0' + (th % 10); th /= 10; }
+                        if (tc == 0) numC[nic++] = '0'; else while (tc > 0) { numC[nic++] = '0' + (tc % 10); tc /= 10; }
+
+                        auto appendStr = [&](const char* s) { while (*s) statusBuf[slen++] = *s++; };
+                        appendStr("STATUS="); appendStr(sStr); appendStr("\r\nWIDTH=");
+                        for (int k = niw - 1; k >= 0; k--) statusBuf[slen++] = numW[k];
+                        appendStr("\r\nHEIGHT=");
+                        for (int k = nih - 1; k >= 0; k--) statusBuf[slen++] = numH[k];
+                        appendStr("\r\nCODE=");
+                        for (int k = nic - 1; k >= 0; k--) statusBuf[slen++] = numC[k];
+                        appendStr("\r\n");
+
+                        DWORD written = 0;
+                        WriteFile(hStatus, statusBuf, slen, &written, nullptr);
+                        CloseHandle(hStatus);
+                    }
+                }
+            }
+        }
+    }
+
+    CloseHandle(hStopEvent);
+    OutLine(L"RESAGENT_STOPPED=YES");
+    OutLine(L"RESULT=SUCCESS");
+    return true;
+}
+
+bool StopResAgent() {
+    HANDLE hStop = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\FluxResAgentStopEvent");
+    if (!hStop) {
+        OutLine(L"STOP_EVENT_NOT_FOUND=YES");
+        OutLine(L"RESULT=NOT_RUNNING");
+        return false;
+    }
+    SetEvent(hStop);
+    CloseHandle(hStop);
+    OutLine(L"STOP_SIGNAL_SENT=YES");
+    OutLine(L"RESULT=SUCCESS");
+    return true;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -1034,6 +1227,44 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (argc >= 2 && StrICmp(argv[1], L"stop") == 0) {
         if (!StopDaemon()) {
+            return 1;
+        }
+        return 0;
+    }
+
+    if (argc == 4 && StrICmp(argv[1], L"setres") == 0) {
+        DWORD width = ParseDec(argv[2]);
+        DWORD height = ParseDec(argv[3]);
+        if (width == 0 || height == 0) {
+            ErrLine(L"Invalid resolution parameters");
+            return 2;
+        }
+        Out(L"REQUESTED_WIDTH="); OutDec(L"", width);
+        Out(L"REQUESTED_HEIGHT="); OutDec(L"", height);
+        LONG res = SetResolution(width, height);
+        Out(L"CHANGE_DISPLAY_SETTINGS_RESULT=");
+        if (res == 0) {
+            OutLine(L"DISP_CHANGE_SUCCESSFUL (0)");
+            OutLine(L"RESULT=SUCCESS");
+            return 0;
+        } else {
+            OutDec(L"ERROR_CODE=", static_cast<DWORD>(res));
+            OutLine(L"RESULT=FAIL");
+            return 1;
+        }
+    }
+
+    if (argc >= 2 && StrICmp(argv[1], L"resagent") == 0) {
+        const wchar_t* path = (argc >= 3) ? argv[2] : L"D:\\flux_resolution_request.txt";
+        DWORD pollMs = (argc >= 4) ? ParseDec(argv[3]) : 250;
+        if (!RunResAgent(path, pollMs)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    if (argc >= 2 && (StrICmp(argv[1], L"stop-resagent") == 0 || StrICmp(argv[1], L"stopres") == 0)) {
+        if (!StopResAgent()) {
             return 1;
         }
         return 0;
@@ -1081,6 +1312,9 @@ int wmain(int argc, wchar_t* argv[]) {
     ErrLine(L"   or: FluxDevNode.exe create <hardware-id> [class-guid]");
     ErrLine(L"   or: FluxDevNode.exe daemon <hardware-id> [duration-sec] [class-guid]");
     ErrLine(L"   or: FluxDevNode.exe stop");
+    ErrLine(L"   or: FluxDevNode.exe setres <width> <height>");
+    ErrLine(L"   or: FluxDevNode.exe resagent [request-path] [poll-ms]");
+    ErrLine(L"   or: FluxDevNode.exe stop-resagent");
     ErrLine(L"   or: FluxDevNode.exe remove <instance-id>");
     return 2;
 }

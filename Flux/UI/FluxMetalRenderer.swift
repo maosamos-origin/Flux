@@ -53,6 +53,7 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
     public private(set) var activeSource: String = "NONE"
     public private(set) var renderedFrameCount: Int = 0
     public private(set) var uniqueFramesPresentedCount: Int = 0
+    public private(set) var textureRecreationCount: Int = 0
     public private(set) var lastRenderedSequence: UInt32 = 0
     private var lastPresentedSequence: UInt32 = 0
     private var lastLoggedSource: String = ""
@@ -64,12 +65,12 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
         var currentSource = "NONE"
         var currentSequence: UInt32 = 0
 
-        // 1. Check for native FluxIdd Indirect Display frame first
-        let iddSize = 800 * 600 * 4
-        if uploadBufferSize < iddSize {
+        // 1. Check for native FluxIdd Indirect Display frame first (up to 16MB bounded maximum)
+        let maxFrameSize = Int(FluxFrameTransportHeader.maxPayloadSize)
+        if uploadBufferSize < maxFrameSize {
             uploadBuffer?.deallocate()
-            uploadBuffer = UnsafeMutableRawPointer.allocate(byteCount: iddSize, alignment: 64)
-            uploadBufferSize = iddSize
+            uploadBuffer = UnsafeMutableRawPointer.allocate(byteCount: maxFrameSize, alignment: 64)
+            uploadBufferSize = maxFrameSize
         }
 
         if let uploadBuffer = self.uploadBuffer,
@@ -118,7 +119,8 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
             desc.storageMode = .shared
             desc.usage = [.shaderRead]
             self.texture = device.makeTexture(descriptor: desc)
-            print("🖥️ [FluxMetalRenderer] Created Metal texture \(width)x\(height) for source=\(currentSource)")
+            textureRecreationCount += 1
+            print("🖥️ [FluxMetalRenderer] (Re)created Metal texture \(width)x\(height) for source=\(currentSource) (recreations=\(textureRecreationCount))")
         }
 
         guard let texture = self.texture,

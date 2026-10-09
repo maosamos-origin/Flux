@@ -8,11 +8,17 @@ public struct FluxFrameTransportHeader {
     public static let statusReady: UInt32 = 2
     public static let formatBGRA8: UInt32 = 87 // DXGI_FORMAT_B8G8R8A8_UNORM
 
+    public static let minWidth: UInt32 = 640
+    public static let maxWidth: UInt32 = 3840
+    public static let minHeight: UInt32 = 480
+    public static let maxHeight: UInt32 = 2160
+    public static let maxPayloadSize: UInt32 = 16 * 1024 * 1024 // 16 MB bounded maximum
+
+    // Fallback reference constants
     public static let expectedWidth: UInt32 = 800
     public static let expectedHeight: UInt32 = 600
     public static let expectedStride: UInt32 = 3200
     public static let expectedDataSize: UInt32 = 1920000
-    public static let maxPayloadSize: UInt32 = 16 * 1024 * 1024 // 16 MB bounded maximum
 
     public var magic: UInt64
     public var version: UInt32
@@ -47,7 +53,7 @@ extension FluxFrameTransportHeader {
 
             let w = raw.loadUnaligned(fromByteOffset: 16, as: UInt32.self)
             let h = raw.loadUnaligned(fromByteOffset: 20, as: UInt32.self)
-            guard w == Self.expectedWidth && h == Self.expectedHeight else { return nil }
+            guard w >= Self.minWidth && w <= Self.maxWidth && h >= Self.minHeight && h <= Self.maxHeight else { return nil }
 
             let str = raw.loadUnaligned(fromByteOffset: 24, as: UInt32.self)
             guard str >= w * 4 else { return nil }
@@ -59,7 +65,7 @@ extension FluxFrameTransportHeader {
             guard !overflow else { return nil }
 
             let ds = raw.loadUnaligned(fromByteOffset: 32, as: UInt32.self)
-            guard ds == calcSize && ds == Self.expectedDataSize && ds <= Self.maxPayloadSize else { return nil }
+            guard ds == calcSize && ds <= Self.maxPayloadSize else { return nil }
 
             let st = raw.loadUnaligned(fromByteOffset: 36, as: UInt32.self)
             guard st == Self.statusReady else { return nil }
@@ -302,6 +308,8 @@ public final class FluxFrameTransport: @unchecked Sendable {
         lastPixelLast = pLast
         lastFrameValid = true
         latestFrameData = Data(payloadBuffer)
+
+        FluxDisplayManager.shared.updateActiveResolution(width: Int(hdr.width), height: Int(hdr.height))
 
         print("📸 [FRAME-TRANSPORT] Session #\(sessionCount) Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), stride=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), P0=0x\(String(p0, radix: 16)), PC=0x\(String(pCenter, radix: 16)), PL=0x\(String(pLast, radix: 16)) valid=true")
 

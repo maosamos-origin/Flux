@@ -4,6 +4,7 @@ struct ContentView: View {
 
     private let engine = FluxEngine()
     @ObservedObject private var framebuffer = FluxFramebuffer.shared
+    @ObservedObject private var displayManager = FluxDisplayManager.shared
     @State private var engineStarted = false
 
     var body: some View {
@@ -16,7 +17,7 @@ struct ContentView: View {
 
                     Spacer()
 
-                    Text("\(framebuffer.width) × \(framebuffer.height)")
+                    Text("\(displayManager.activeWidth) × \(displayManager.activeHeight)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
@@ -33,9 +34,8 @@ struct ContentView: View {
 
                 Divider()
 
-                // Native Metal MTKView
+                // Native Metal MTKView with responsive viewport and dynamic mode adaptation
                 FluxDisplayView()
-                    .aspectRatio(CGFloat(max(1, framebuffer.width)) / CGFloat(max(1, framebuffer.height)), contentMode: .fit)
                     .frame(minWidth: 800, minHeight: 600)
                     .background(Color.black)
             } else {

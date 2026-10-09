@@ -45,6 +45,8 @@ public final class FluxFramebuffer: ObservableObject, @unchecked Sendable {
             self.objectWillChange.send()
         }
 
+        FluxDisplayManager.shared.updateActiveResolution(width: Int(width), height: Int(height))
+
         print("🖥️ [FluxFramebuffer] Configured: \(width)x\(height), stride=\(stride), guestAddr=0x\(String(guestAddress, radix: 16)), hostPtr=\(hostPointer)")
     }
 

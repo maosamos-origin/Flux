@@ -1,33 +1,49 @@
 import Foundation
 import CoreGraphics
+import Combine
 
 /// Manages guest display resolution synchronization, viewport mapping, debounce,
 /// and mode transition safety for Flux.
-public final class FluxDisplayManager: @unchecked Sendable {
+public final class FluxDisplayManager: ObservableObject, @unchecked Sendable {
 
     public static let shared = FluxDisplayManager()
 
     private let lock = NSLock()
-    private var lastRequestedWidth: Int = 0
-    private var lastRequestedHeight: Int = 0
-    private var isSwitchingMode: Bool = false
 
-    /// Standard display modes supported for dynamic desktop synchronization.
+    @Published public private(set) var activeWidth: Int = 800
+    @Published public private(set) var activeHeight: Int = 600
+    public private(set) var lastRequestedWidth: Int = 0
+    public private(set) var lastRequestedHeight: Int = 0
+    public private(set) var isSwitchingMode: Bool = false
+    public private(set) var modeSwitchCount: Int = 0
+
+    /// Exact 4 display modes supported by FluxIdd for dynamic desktop synchronization.
     public static let supportedModes: [(width: Int, height: Int)] = [
-        (800, 600),    // 4:3 SVGA baseline
-        (1024, 768),   // 4:3 XGA
+        (800, 600),    // SVGA compatibility fallback
         (1280, 720),   // 16:9 HD
-        (1280, 800),   // 16:10 WXGA
-        (1366, 768),   // 16:9 HD
-        (1440, 900),   // 16:10 WXGA+
         (1600, 900),   // 16:9 HD+
-        (1680, 1050),  // 16:10 WSXGA+
-        (1920, 1080),  // 16:9 Full HD
-        (1920, 1200),  // 16:10 WUXGA
-        (2560, 1440)   // 16:9 QHD
+        (1920, 1080)   // 16:9 Full HD
     ]
 
     private init() {}
+
+    /// Updates the active resolution reported by the display driver or framebuffer.
+    public func updateActiveResolution(width: Int, height: Int) {
+        lock.lock()
+        guard width > 0 && height > 0, (width != activeWidth || height != activeHeight) else {
+            lock.unlock()
+            return
+        }
+        activeWidth = width
+        activeHeight = height
+        modeSwitchCount += 1
+        lock.unlock()
+
+        DispatchQueue.main.async {
+            self.objectWillChange.send()
+        }
+        print("🖥️ [DYNAMIC-RESO] Active resolution updated to: \(width)x\(height) (switches=\(modeSwitchCount))")
+    }
 
     /// Chooses the optimal guest resolution matching the host viewport aspect ratio and size.
     public static func targetResolution(for viewportSize: CGSize) -> (width: Int, height: Int) {
@@ -81,9 +97,12 @@ public final class FluxDisplayManager: @unchecked Sendable {
 
         print("🖥️ [DYNAMIC-RESO] Requesting guest resolution change: \(width)x\(height) (stride=\(Self.stride(forWidth: width)))")
 
-        // In Microsoft Basic Display / UEFI GOP architecture, dynamic resolution change
-        // is assisted by the guest agent protocol: RESO <width> <height>\n
-        // If guest agent is present, it switches display mode; otherwise timeout cleanly keeps previous mode.
+        // Persist resolution request for guest agent retrieval
+        let requestContent = "\(width) \(height)\r\n"
+        let appDir = FluxVM.defaultAppDirectory()
+        let requestPath = appDir + "/flux_resolution_request.txt"
+        try? requestContent.write(toFile: requestPath, atomically: true, encoding: .utf8)
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
 
@@ -91,20 +110,18 @@ public final class FluxDisplayManager: @unchecked Sendable {
             let timeout = DispatchTime.now() + 3.0
             var completed = false
 
-            // Query current framebuffer
-            let snap = FluxFramebuffer.shared.snapshot()
-            if snap.width == width && snap.height == height {
+            // Check if active resolution already matches
+            self.lock.lock()
+            if self.activeWidth == width && self.activeHeight == height {
                 completed = true
             }
-
-            self.lock.lock()
             self.isSwitchingMode = false
             self.lock.unlock()
 
             if completed {
                 print("✅ [DYNAMIC-RESO] Mode switch confirmed: \(width)x\(height)")
             } else {
-                print("⚠️ [DYNAMIC-RESO] Mode switch request \(width)x\(height) completed; maintaining active mode \(snap.width)x\(snap.height)")
+                print("⚠️ [DYNAMIC-RESO] Mode switch request \(width)x\(height) registered; awaiting guest confirmation")
             }
         }
     }

@@ -129,10 +129,11 @@ internal final class FluxDiagnosticDisplayView: MTKView {
         guard viewSize.width > 0 && viewSize.height > 0 else { return }
 
         let target = FluxDisplayManager.targetResolution(for: viewSize)
-        let current = FluxFramebuffer.shared.snapshot()
-        print("🖥️ [DYNAMIC-RESO] Viewport resized: \(Int(viewSize.width))x\(Int(viewSize.height)) -> Target: \(target.width)x\(target.height) (Active: \(current.width)x\(current.height))")
+        let activeWidth = FluxDisplayManager.shared.activeWidth
+        let activeHeight = FluxDisplayManager.shared.activeHeight
+        print("🖥️ [DYNAMIC-RESO] Viewport resized: \(Int(viewSize.width))x\(Int(viewSize.height)) -> Target: \(target.width)x\(target.height) (Active: \(activeWidth)x\(activeHeight))")
 
-        if current.width != target.width || current.height != target.height {
+        if activeWidth != target.width || activeHeight != target.height {
             FluxDisplayManager.shared.requestResolutionChange(width: target.width, height: target.height)
         }
     }
