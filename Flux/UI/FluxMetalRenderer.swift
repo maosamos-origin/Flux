@@ -52,7 +52,9 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
 
     public private(set) var activeSource: String = "NONE"
     public private(set) var renderedFrameCount: Int = 0
+    public private(set) var uniqueFramesPresentedCount: Int = 0
     public private(set) var lastRenderedSequence: UInt32 = 0
+    private var lastPresentedSequence: UInt32 = 0
     private var lastLoggedSource: String = ""
 
     func draw(in view: MTKView) {
@@ -180,10 +182,16 @@ final class FluxMetalRenderer: NSObject, MTKViewDelegate {
         commandBuffer.present(drawable)
         commandBuffer.commit()
 
+        let isNewUnique = (currentSource == "FluxIdd" && currentSequence > 0 && currentSequence != lastPresentedSequence)
+        if isNewUnique {
+            lastPresentedSequence = currentSequence
+            uniqueFramesPresentedCount += 1
+        }
+
         renderedFrameCount += 1
         activeSource = currentSource
         lastRenderedSequence = currentSequence
-        FluxFrameTransport.shared.recordRenderedFrame(source: currentSource, sequence: currentSequence)
+        FluxFrameTransport.shared.recordRenderedFrame(source: currentSource, sequence: currentSequence, isNewUniqueFrame: isNewUnique)
 
         if currentSource != lastLoggedSource {
             lastLoggedSource = currentSource

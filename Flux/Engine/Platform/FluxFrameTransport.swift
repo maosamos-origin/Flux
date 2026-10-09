@@ -206,6 +206,26 @@ public final class FluxFrameTransport: @unchecked Sendable {
                 }
 
             case .payload:
+                // Check if a new frame header arrived early at this block boundary
+                // (e.g. previous frame truncated, guest aborted, or fresh frame started)
+                if (count - offset) >= 60 {
+                    let peekMagic = UnsafeRawPointer(raw + offset).loadUnaligned(as: UInt64.self)
+                    if peekMagic == FluxFrameTransportHeader.magicValue {
+                        let candidateBytes = Array(UnsafeBufferPointer(start: raw + offset, count: 60))
+                        if let newHdr = FluxFrameTransportHeader(bytes: candidateBytes) {
+                            if newHdr.sequence == 1 || (sessionActive && newHdr.sequence > sessionLastSequence) {
+                                print("⚠️ [FRAME-TRANSPORT] New frame header seq=\(newHdr.sequence) arrived early while in payload (have \(payloadBuffer.count)/\(expectedPayloadSize)); resynchronizing")
+                                state = .idle
+                                magicBuffer.removeAll(keepingCapacity: true)
+                                headerBuffer.removeAll(keepingCapacity: true)
+                                payloadBuffer.removeAll(keepingCapacity: true)
+                                currentHeader = nil
+                                continue
+                            }
+                        }
+                    }
+                }
+
                 let needed = expectedPayloadSize - payloadBuffer.count
                 let available = count - offset
                 let toCopy = (needed < available) ? needed : available
@@ -290,12 +310,16 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
     // Render tracking fields
     public private(set) var renderedFrameCount: Int = 0
+    public private(set) var uniqueFramesPresentedCount: Int = 0
     public private(set) var lastRenderedSequence: UInt32 = 0
     public private(set) var activeRenderSource: String = "NONE"
 
-    public func recordRenderedFrame(source: String, sequence: UInt32) {
+    public func recordRenderedFrame(source: String, sequence: UInt32, isNewUniqueFrame: Bool = false) {
         lock.lock()
         renderedFrameCount += 1
+        if isNewUniqueFrame {
+            uniqueFramesPresentedCount += 1
+        }
         activeRenderSource = source
         lastRenderedSequence = sequence
         lock.unlock()
@@ -355,6 +379,7 @@ public final class FluxFrameTransport: @unchecked Sendable {
             "PIXEL_LAST=0x" + String(format: "%08X", lastPixelLast),
             "SEQUENCE_HISTORY=" + sequenceHistory.map { String($0) }.joined(separator: ","),
             "RENDERED_FRAME_COUNT=\(renderedFrameCount)",
+            "UNIQUE_FRAMES_PRESENTED=\(uniqueFramesPresentedCount)",
             "RENDERED_SOURCE=\(activeRenderSource)",
             "LAST_RENDERED_SEQUENCE=\(lastRenderedSequence)"
         ]
@@ -386,6 +411,7 @@ public final class FluxFrameTransport: @unchecked Sendable {
         PIXEL_LAST=0x\(String(format: "%08X", lastPixelLast))
         SEQUENCE_HISTORY=\(sequenceHistory.map { String($0) }.joined(separator: ","))
         RENDERED_FRAME_COUNT=\(renderedFrameCount)
+        UNIQUE_FRAMES_PRESENTED=\(uniqueFramesPresentedCount)
         RENDERED_SOURCE=\(activeRenderSource)
         LAST_RENDERED_SEQUENCE=\(lastRenderedSequence)
         """

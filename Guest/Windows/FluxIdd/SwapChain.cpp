@@ -79,6 +79,11 @@ struct SwapChainSession final {
     volatile LONG setDeviceHr;
     volatile LONG transportSequence;
     volatile LONG transportFrameCount;
+    volatile LONG lastTransmittedChecksum;
+    volatile LONG lastTransmittedP0;
+    volatile LONG lastTransmittedPC;
+    volatile LONG lastTransmittedPL;
+    ULONGLONG lastTransmittedTick;
 };
 
 static SwapChainSession* CreateSwapChainSession() {
@@ -110,6 +115,11 @@ static SwapChainSession* CreateSwapChainSession() {
         s->setDeviceHr = 0;
         s->transportSequence = 0;
         s->transportFrameCount = 0;
+        s->lastTransmittedChecksum = 0;
+        s->lastTransmittedP0 = 0;
+        s->lastTransmittedPC = 0;
+        s->lastTransmittedPL = 0;
+        s->lastTransmittedTick = 0;
     }
     return s;
 }
@@ -468,8 +478,8 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
             if (surfaceValid) {
                 LONG64 proc = InterlockedIncrement64(&session->frameProcessedCount);
 
-                // Host Frame Transport transmission (proc <= 5 transmits frames 1..5)
-                if (session->stagingTexture && session->hTransportFile != INVALID_HANDLE_VALUE && proc <= 5) {
+                // Host Frame Transport transmission (continuous streaming throughout swapchain lifetime)
+                if (session->stagingTexture && session->hTransportFile != INVALID_HANDLE_VALUE) {
                     ComPtr<ID3D11DeviceContext> d3dContext;
                     session->d3dDevice->GetImmediateContext(&d3dContext);
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -490,54 +500,75 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         UINT lastOff = (height - 1) * stride + (width - 1) * 4;
                         UINT32 pLast = (lastOff + 4 <= dataSize) ? *reinterpret_cast<const UINT32*>(pSrc + lastOff) : 0;
 
-                        LONG seq = InterlockedIncrement(&session->transportSequence);
+                        ULONGLONG now = GetTickCount64();
+                        bool contentChanged = (checksum != static_cast<UINT32>(session->lastTransmittedChecksum) ||
+                                               p0 != static_cast<UINT32>(session->lastTransmittedP0) ||
+                                               pCenter != static_cast<UINT32>(session->lastTransmittedPC) ||
+                                               pLast != static_cast<UINT32>(session->lastTransmittedPL));
 
-                        FluxFrameTransportHeader hdr = {};
-                        hdr.magic[0] = 'F'; hdr.magic[1] = 'L'; hdr.magic[2] = 'X'; hdr.magic[3] = 'F';
-                        hdr.magic[4] = 'T'; hdr.magic[5] = 'R'; hdr.magic[6] = 'A'; hdr.magic[7] = 'N';
-                        hdr.version = 1;
-                        hdr.sequence = static_cast<UINT32>(seq);
-                        hdr.width = width;
-                        hdr.height = height;
-                        hdr.stride = stride;
-                        hdr.pixelFormat = format;
-                        hdr.dataSize = dataSize;
-                        hdr.status = 2; // READY
-                        hdr.checksum = checksum;
-                        hdr.pixel0 = p0;
-                        hdr.pixelCenter = pCenter;
-                        hdr.pixelLast = pLast;
-                        hdr.reserved = 0;
+                        // Transmit on desktop content change, on 1000ms heartbeat, or on initial frames
+                        if (contentChanged || (now - session->lastTransmittedTick >= 1000) || session->transportFrameCount == 0) {
+                            session->lastTransmittedChecksum = static_cast<LONG>(checksum);
+                            session->lastTransmittedP0 = static_cast<LONG>(p0);
+                            session->lastTransmittedPC = static_cast<LONG>(pCenter);
+                            session->lastTransmittedPL = static_cast<LONG>(pLast);
+                            session->lastTransmittedTick = now;
 
-                        DWORD written = 0;
-                        WriteFile(session->hTransportFile, &hdr, sizeof(hdr), &written, nullptr);
+                            LONG seq = InterlockedIncrement(&session->transportSequence);
 
-                        const DWORD chunkSize = 65536;
-                        DWORD offset = 0;
-                        while (offset < dataSize) {
-                            if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
-                                break;
+                            FluxFrameTransportHeader hdr = {};
+                            hdr.magic[0] = 'F'; hdr.magic[1] = 'L'; hdr.magic[2] = 'X'; hdr.magic[3] = 'F';
+                            hdr.magic[4] = 'T'; hdr.magic[5] = 'R'; hdr.magic[6] = 'A'; hdr.magic[7] = 'N';
+                            hdr.version = 1;
+                            hdr.sequence = static_cast<UINT32>(seq);
+                            hdr.width = width;
+                            hdr.height = height;
+                            hdr.stride = stride;
+                            hdr.pixelFormat = format;
+                            hdr.dataSize = dataSize;
+                            hdr.status = 2; // READY
+                            hdr.checksum = checksum;
+                            hdr.pixel0 = p0;
+                            hdr.pixelCenter = pCenter;
+                            hdr.pixelLast = pLast;
+                            hdr.reserved = 0;
+
+                            // Rewind to start of file to keep backing storage fixed at 1 frame (1.83 MB)
+                            SetFilePointer(session->hTransportFile, 0, nullptr, FILE_BEGIN);
+
+                            DWORD written = 0;
+                            WriteFile(session->hTransportFile, &hdr, sizeof(hdr), &written, nullptr);
+
+                            const DWORD chunkSize = 65536;
+                            DWORD offset = 0;
+                            while (offset < dataSize) {
+                                if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
+                                    break;
+                                }
+                                DWORD remaining = dataSize - offset;
+                                DWORD toWrite = (chunkSize < remaining) ? chunkSize : remaining;
+                                DWORD chunkWritten = 0;
+                                if (!WriteFile(session->hTransportFile, pSrc + offset, toWrite, &chunkWritten, nullptr) || chunkWritten == 0) {
+                                    break;
+                                }
+                                offset += chunkWritten;
                             }
-                            DWORD remaining = dataSize - offset;
-                            DWORD toWrite = (chunkSize < remaining) ? chunkSize : remaining;
-                            DWORD chunkWritten = 0;
-                            if (!WriteFile(session->hTransportFile, pSrc + offset, toWrite, &chunkWritten, nullptr) || chunkWritten == 0) {
-                                break;
+
+                            FlushFileBuffers(session->hTransportFile);
+
+                            if (offset == dataSize) {
+                                InterlockedIncrement(&session->transportFrameCount);
+                                if (seq == 1 || (seq % 30 == 0)) {
+                                    char msg[256];
+                                    sprintf_s(msg, sizeof(msg),
+                                        "FluxIdd: FRAME_TRANSPORT_SUCCESS seq=%ld width=%u height=%u size=%u checksum=0x%08X\n",
+                                        seq, width, height, dataSize, checksum);
+                                    OutputDebugStringA(msg);
+                                }
                             }
-                            offset += chunkWritten;
                         }
 
-                        FlushFileBuffers(session->hTransportFile);
                         d3dContext->Unmap(session->stagingTexture.Get(), 0);
-
-                        if (offset == dataSize) {
-                            InterlockedIncrement(&session->transportFrameCount);
-                            char msg[256];
-                            sprintf_s(msg, sizeof(msg),
-                                "FluxIdd: FRAME_TRANSPORT_SUCCESS seq=%ld width=%u height=%u size=%u checksum=0x%08X\n",
-                                seq, width, height, dataSize, checksum);
-                            OutputDebugStringA(msg);
-                        }
                     }
                 }
 

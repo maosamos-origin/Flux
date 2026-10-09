@@ -350,7 +350,7 @@ jobs:
             Write-Host "== $label (exit $code) =="
             Write-Host $text
             $knownTrustError = 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider.'
-            $hasKnownTrustError = $normalized.Contains($knownTrustError)
+            $hasKnownTrustError = $normalized.Contains($knownTrustError) -or ($normalized -like '*A certificate chain processed, but terminated in a root*' -and $normalized -match 'certificate which is not trusted by the trust provider')
             $signToolErrors = @([regex]::Matches($normalized, 'SignTool Error: (.*?)(?= SignTool Error:|$)') | ForEach-Object { $_.Groups[1].Value.Trim() })
             Write-Host "DEBUG catalogMembership=$catalogMembership"
             Write-Host "DEBUG code=$code"

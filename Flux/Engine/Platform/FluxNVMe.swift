@@ -82,6 +82,7 @@ nonisolated final class FluxNVMe {
     private var targetDiskPath = ""
     private var lastLoggedTargetIdentity: DiskIdentity?
     private var installerFD: Int32 = -1
+    private var ns2DataOffset: UInt64 = 0
     private var totalTargetBytesWritten: UInt64 = 0
     private var lastMilestoneMB: UInt64 = 0
 
@@ -396,6 +397,37 @@ nonisolated final class FluxNVMe {
                 }
                 numNamespaces = 2
                 print("📀 FluxNVMe: Configured Namespace 2 (Installer/Media) sectors=\(installerSectors)")
+
+                // Dynamically discover FAT32 data cluster offset from the boot record to avoid hardcoded offsets
+                var detectedDataOffset: UInt64 = 0
+                var mbrSector = [UInt8](repeating: 0, count: 512)
+                if pread(installerFD, &mbrSector, 512, 0) == 512 {
+                    let partStartLBA = UInt32(mbrSector[446 + 8]) |
+                                      (UInt32(mbrSector[446 + 9]) << 8) |
+                                      (UInt32(mbrSector[446 + 10]) << 16) |
+                                      (UInt32(mbrSector[446 + 11]) << 24)
+                    if partStartLBA > 0 {
+                        var vbrSector = [UInt8](repeating: 0, count: 512)
+                        let vbrOffset = off_t(partStartLBA) * 512
+                        if pread(installerFD, &vbrSector, 512, vbrOffset) == 512 {
+                            let bytesPerSec = UInt16(vbrSector[11]) | (UInt16(vbrSector[12]) << 8)
+                            let rsvdSec = UInt16(vbrSector[14]) | (UInt16(vbrSector[15]) << 8)
+                            let numFats = UInt16(vbrSector[16])
+                            let fatSize = UInt32(vbrSector[36]) |
+                                         (UInt32(vbrSector[37]) << 8) |
+                                         (UInt32(vbrSector[38]) << 16) |
+                                         (UInt32(vbrSector[39]) << 24)
+                            if bytesPerSec == 512 && rsvdSec > 0 && numFats > 0 && fatSize > 0 {
+                                let totalMetaSectors = UInt64(partStartLBA) + UInt64(rsvdSec) + UInt64(numFats) * UInt64(fatSize)
+                                detectedDataOffset = totalMetaSectors * UInt64(bytesPerSec)
+                            }
+                        }
+                    }
+                }
+                self.ns2DataOffset = detectedDataOffset
+                if detectedDataOffset > 0 {
+                    print("📀 FluxNVMe: NSID 2 dynamic FAT32 data area starts at 0x\(String(detectedDataOffset, radix: 16)) (\(detectedDataOffset) bytes)")
+                }
             } else {
                 print("⚠️ FluxNVMe: Could not open installer disk at \(instPath); single namespace mode")
                 numNamespaces = 1
@@ -1607,8 +1639,8 @@ nonisolated final class FluxNVMe {
                     _ = pwritev(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
                 }
                 // Verified designated channel for Frame Transport packets:
-                // Only feed data cluster writes (>= 0x205000) to isolate filesystem metadata (FAT tables, directory, boot sector)
-                if req.fileOffset >= 0x205000 {
+                // Only feed data cluster writes (>= ns2DataOffset) to isolate filesystem metadata (FAT tables, directory, boot sector)
+                if req.fileOffset >= self.ns2DataOffset {
                     for iov in req.iovs {
                         if let base = iov.iov_base, iov.iov_len > 0 {
                             FluxFrameTransport.shared.consumeBytes(base, count: iov.iov_len)
