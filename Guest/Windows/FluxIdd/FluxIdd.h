@@ -31,6 +31,6 @@ EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN FluxIddMonitorUnassignSwapChain;
 
 NTSTATUS FluxIddInitializeAdapter(WDFDEVICE device);
 NTSTATUS FluxIddCreateAndArriveMonitor(IDDCX_ADAPTER adapter);
-IDDCX_MONITOR_MODE FluxIddMakeMonitorMode(const FluxIddMode& mode);
+IDDCX_MONITOR_MODE FluxIddMakeMonitorMode(const FluxIddMode& mode, IDDCX_MONITOR_MODE_ORIGIN origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
 IDDCX_TARGET_MODE FluxIddMakeTargetMode(const FluxIddMode& mode);
 void FluxIddStopWorker(FluxMonitorContext* ctx);

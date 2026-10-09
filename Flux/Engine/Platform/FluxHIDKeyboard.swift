@@ -347,17 +347,19 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         let rebootVerifyTest = ProcessInfo.processInfo.environment["FLUX_TEST_REBOOT_VERIFY"] == "1"
         let pnpRestartTest = ProcessInfo.processInfo.environment["FLUX_TEST_PNP_RESTART"] == "1"
         let swdMigrationTest = ProcessInfo.processInfo.environment["FLUX_TEST_SWD_MIGRATION"] == "1"
+        let milestone3Test = ProcessInfo.processInfo.environment["FLUX_TEST_MILESTONE3"] == "1"
 #else
         let finishInstallTest = false
         let rebootVerifyTest = false
         let pnpRestartTest = false
         let swdMigrationTest = false
+        let milestone3Test = false
 #endif
         let competingModes = [
             tpCertutilTest ? "FLUX_TEST_TP_CERTUTIL" : nil,
             signingPolicyAuditTest ? "FLUX_TEST_SIGNING_AUDIT" : nil
         ].compactMap { $0 }.joined(separator: ",")
-        guard tpCertutilTest || signingPolicyAuditTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest else {
+        guard tpCertutilTest || signingPolicyAuditTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test else {
             if let val = launcherFlagValue {
                 Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] timestamp=\(launchTimestamp) flagValue=\(val) schedulerEntered=NO timerArmed=NO skipReason=FLAG_VALUE_NOT_1")
             }
@@ -372,7 +374,9 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         let oneShotBefore = testStarted
         guard !testStarted else {
             lock.unlock()
-            if swdMigrationTest {
+            if milestone3Test {
+                self.runMilestone3Test()
+            } else if swdMigrationTest {
                 self.runSwdMigrationTest()
             } else if pnpRestartTest {
                 self.runPnpRestartTest()
@@ -392,7 +396,9 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
             Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] oneShotBefore=\(oneShotBefore) oneShotAfter=\(oneShotAfter) timerArmed=YES delaySeconds=75")
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + 75.0) { [weak self] in
-            if swdMigrationTest {
+            if milestone3Test {
+                self?.runMilestone3Test()
+            } else if swdMigrationTest {
                 self?.runSwdMigrationTest()
             } else if pnpRestartTest {
                 self?.runPnpRestartTest()
@@ -425,13 +431,15 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         let rebootVerifyTest = ProcessInfo.processInfo.environment["FLUX_TEST_REBOOT_VERIFY"] == "1"
         let pnpRestartTest = ProcessInfo.processInfo.environment["FLUX_TEST_PNP_RESTART"] == "1"
         let swdMigrationTest = ProcessInfo.processInfo.environment["FLUX_TEST_SWD_MIGRATION"] == "1"
+        let milestone3Test = ProcessInfo.processInfo.environment["FLUX_TEST_MILESTONE3"] == "1"
 #else
         let finishInstallTest = false
         let rebootVerifyTest = false
         let pnpRestartTest = false
         let swdMigrationTest = false
+        let milestone3Test = false
 #endif
-        guard liveKeyboardTest || winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest else { return }
+        guard liveKeyboardTest || winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test else { return }
         lock.lock()
         if testStarted {
             lock.unlock()
@@ -443,10 +451,12 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         testStarted = true
         lock.unlock()
 
-        let delay: TimeInterval = (winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest) ? 60.0 : 2.5
+        let delay: TimeInterval = (winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test) ? 60.0 : 2.5
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            if swdMigrationTest {
+            if milestone3Test {
+                self.runMilestone3Test()
+            } else if swdMigrationTest {
                 self.runSwdMigrationTest()
             } else if pnpRestartTest {
                 self.runPnpRestartTest()
@@ -1029,6 +1039,73 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         Thread.sleep(forTimeInterval: 50.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/swd-migration-complete.bmp")
         print("[SWD-MIGRATION] SWD migration execution window completed")
+    }
+
+    /// Milestone 3: Controlled Driver Update to Run #53 and Multi-Mode Resolution Testing
+    private func runMilestone3Test() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let appDir = FluxVM.defaultAppDirectory()
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-baseline-800x600.bmp")
+        print("[MILESTONE3] Baseline screenshot captured at 800x600")
+
+        let launcherCommand = "powershell.exe -NoProfile -Command \"Start-Process 'D:\\FluxMilestone3.cmd' -Verb RunAs\""
+        print("[MILESTONE3] Launching fixed elevated Milestone 3 launcher via Win+R")
+        sendWinR(command: launcherCommand)
+        appendAutoKeyTrace(action: "MILESTONE3_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[MILESTONE3] Submitted fixed Milestone 3 command via Win+R")
+
+        Thread.sleep(forTimeInterval: 4.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-launched.bmp")
+
+        // Approve UAC consent dialog via Alt+Y:
+        print("[MILESTONE3] Approving UAC consent dialog via Alt+Y...")
+        handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyUp(keyCode: 0x10) // Y up
+        Thread.sleep(forTimeInterval: 0.15)
+        handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Second Alt+Y in case the first was during secure desktop transition
+        handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
+        Thread.sleep(forTimeInterval: 0.15)
+        handleKeyUp(keyCode: 0x10) // Y up
+        Thread.sleep(forTimeInterval: 0.15)
+        handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+
+        print("[MILESTONE3] UAC approvals dispatched. Waiting for driver update & multi-mode tests...")
+
+        // Step 2 update takes ~28s (cert import + stop + pnputil del/add + devcon + start daemon + settle):
+        Thread.sleep(forTimeInterval: 30.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-update-done.bmp")
+
+        // Step 4 Mode 1: 800x600 (4s settle)
+        Thread.sleep(forTimeInterval: 6.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-800x600.bmp")
+
+        // Step 4 Mode 2: 1280x720 (4s settle)
+        Thread.sleep(forTimeInterval: 6.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-1280x720.bmp")
+
+        // Step 4 Mode 3: 1600x900 (4s settle)
+        Thread.sleep(forTimeInterval: 6.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-1600x900.bmp")
+
+        // Step 4 Mode 4: 1920x1080 (4s settle)
+        Thread.sleep(forTimeInterval: 6.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-1920x1080.bmp")
+
+        // Step 5 Resagent startup & evidence copy
+        Thread.sleep(forTimeInterval: 10.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-complete.bmp")
+        print("[MILESTONE3] Milestone 3 automated test sequence complete")
     }
 #endif
 
