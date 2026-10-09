@@ -385,14 +385,17 @@ nonisolated final class FluxNVMe {
         }
 
         if let instPath = installerDiskPath {
-            installerFD = open(instPath, O_RDONLY)
+            installerFD = open(instPath, O_RDWR)
+            if installerFD < 0 {
+                installerFD = open(instPath, O_RDONLY)
+            }
             if installerFD >= 0 {
                 var instSt = stat()
                 if fstat(installerFD, &instSt) == 0 {
                     installerSectors = UInt64(instSt.st_size) / sectorSize
                 }
                 numNamespaces = 2
-                print("📀 FluxNVMe: Configured Namespace 2 (Installer) sectors=\(installerSectors) (ReadOnly)")
+                print("📀 FluxNVMe: Configured Namespace 2 (Installer/Media) sectors=\(installerSectors)")
             } else {
                 print("⚠️ FluxNVMe: Could not open installer disk at \(instPath); single namespace mode")
                 numNamespaces = 1
@@ -1502,7 +1505,7 @@ nonisolated final class FluxNVMe {
             } else {
                 range = (offset: 0, length: 0)
             }
-            let fd = (opc == 0x02) ? ((nsid == 1) ? targetFD : installerFD) : targetFD
+            let fd = (nsid == 1) ? targetFD : installerFD
             let totalBytes = range.length
             let fileOffset = range.offset
             let chunks = resolvePRP(prp1: prp1, prp2: prp2, totalBytes: totalBytes)
@@ -1521,7 +1524,7 @@ nonisolated final class FluxNVMe {
                 iovs: iovs
             )
 
-            let isBarrier = (opc == 0x00) // FLUSH executes as a barrier to ensure write ordering
+            let isBarrier = (opc == 0x00) || (nsid == 2 && opc == 0x01) // FLUSH and NSID 2 transport execute as barriers for strict chunk ordering
             workerPool.submit(isBarrier: isBarrier) { [weak self] in
                 guard let self else { return }
                 self.executeAsyncHostIO(req)
@@ -1598,20 +1601,27 @@ nonisolated final class FluxNVMe {
 
         case 0x01: // Write
             if req.nsid == 2 {
-                // Read-only namespace: silently discard
-                completeIORequest(generation: req.generation, sqid: req.sqid, cqId: req.cqId, cid: req.cid, dw0: 0, status: 0)
-                return
-            }
-            validationUpdate { $0.writeBytes += UInt64(req.totalBytes) }
-
-            if req.fd >= 0 && !req.iovs.isEmpty {
-                var localIovs = req.iovs
-                _ = pwritev(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
+                // Namespace 2 (Secondary Driver/Media disk): write through to backing storage
+                if req.fd >= 0 && !req.iovs.isEmpty {
+                    var localIovs = req.iovs
+                    _ = pwritev(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
+                }
+                // Verified designated channel for Frame Transport packets:
                 for iov in req.iovs {
                     if let base = iov.iov_base, iov.iov_len > 0 {
                         FluxFrameTransport.shared.consumeBytes(base, count: iov.iov_len)
                     }
                 }
+                completeIORequest(generation: req.generation, sqid: req.sqid, cqId: req.cqId, cid: req.cid, dw0: 0, status: 0)
+                return
+            }
+
+            // Namespace 1 (Windows Target OS disk): standard persistent writes with ZERO frame interception
+            validationUpdate { $0.writeBytes += UInt64(req.totalBytes) }
+
+            if req.fd >= 0 && !req.iovs.isEmpty {
+                var localIovs = req.iovs
+                _ = pwritev(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
             }
 
             statsLock.lock()

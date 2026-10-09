@@ -235,10 +235,6 @@ nonisolated final class FluxUART {
         case dr:
             let byte = UInt8(value32 & 0xFF)
 
-            if FluxFrameTransport.shared.consumeByte(byte) {
-                return true
-            }
-
             if let scalar = UnicodeScalar(Int(byte)) {
                 let character = Character(scalar)
 

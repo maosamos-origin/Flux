@@ -5,6 +5,14 @@ import Foundation
 public struct FluxFrameTransportHeader {
     public static let magicValue: UInt64 = 0x4E41525446584C46 // "FLXFTRAN" in little-endian
     public static let expectedVersion: UInt32 = 1
+    public static let statusReady: UInt32 = 2
+    public static let formatBGRA8: UInt32 = 87 // DXGI_FORMAT_B8G8R8A8_UNORM
+
+    public static let expectedWidth: UInt32 = 800
+    public static let expectedHeight: UInt32 = 600
+    public static let expectedStride: UInt32 = 3200
+    public static let expectedDataSize: UInt32 = 1920000
+    public static let maxPayloadSize: UInt32 = 16 * 1024 * 1024 // 16 MB bounded maximum
 
     public var magic: UInt64
     public var version: UInt32
@@ -20,15 +28,68 @@ public struct FluxFrameTransportHeader {
     public var pixelCenter: UInt32
     public var pixelLast: UInt32
     public var reserved: UInt32
+}
 
+extension FluxFrameTransportHeader {
+    /// Strictly validates all header fields before returning a valid header instance.
+    /// Rejects any header with invalid magic, version, format, dimensions, stride, or payload size.
     public init?(bytes: [UInt8]) {
         guard bytes.count >= 60 else { return nil }
-        self = bytes.withUnsafeBytes { raw in
-            raw.load(as: FluxFrameTransportHeader.self)
-        }
-        guard magic == Self.magicValue && version == Self.expectedVersion else {
+        guard let hdr = bytes.withUnsafeBytes({ raw -> FluxFrameTransportHeader? in
+            let m = raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
+            guard m == Self.magicValue else { return nil }
+
+            let v = raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self)
+            guard v == Self.expectedVersion else { return nil }
+
+            let seq = raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self)
+            guard seq > 0 else { return nil }
+
+            let w = raw.loadUnaligned(fromByteOffset: 16, as: UInt32.self)
+            let h = raw.loadUnaligned(fromByteOffset: 20, as: UInt32.self)
+            guard w == Self.expectedWidth && h == Self.expectedHeight else { return nil }
+
+            let str = raw.loadUnaligned(fromByteOffset: 24, as: UInt32.self)
+            guard str >= w * 4 else { return nil }
+
+            let pf = raw.loadUnaligned(fromByteOffset: 28, as: UInt32.self)
+            guard pf == Self.formatBGRA8 else { return nil }
+
+            let (calcSize, overflow) = str.multipliedReportingOverflow(by: h)
+            guard !overflow else { return nil }
+
+            let ds = raw.loadUnaligned(fromByteOffset: 32, as: UInt32.self)
+            guard ds == calcSize && ds == Self.expectedDataSize && ds <= Self.maxPayloadSize else { return nil }
+
+            let st = raw.loadUnaligned(fromByteOffset: 36, as: UInt32.self)
+            guard st == Self.statusReady else { return nil }
+
+            let ck = raw.loadUnaligned(fromByteOffset: 40, as: UInt32.self)
+            let p0 = raw.loadUnaligned(fromByteOffset: 44, as: UInt32.self)
+            let pc = raw.loadUnaligned(fromByteOffset: 48, as: UInt32.self)
+            let pl = raw.loadUnaligned(fromByteOffset: 52, as: UInt32.self)
+            let res = raw.loadUnaligned(fromByteOffset: 56, as: UInt32.self)
+
+            return FluxFrameTransportHeader(
+                magic: m,
+                version: v,
+                sequence: seq,
+                width: w,
+                height: h,
+                stride: str,
+                pixelFormat: pf,
+                dataSize: ds,
+                status: st,
+                checksum: ck,
+                pixel0: p0,
+                pixelCenter: pc,
+                pixelLast: pl,
+                reserved: res
+            )
+        }) else {
             return nil
         }
+        self = hdr
     }
 }
 
@@ -57,9 +118,14 @@ public final class FluxFrameTransport: @unchecked Sendable {
         UInt8(ascii: "T"), UInt8(ascii: "R"), UInt8(ascii: "A"), UInt8(ascii: "N")
     ]
 
-    // Telemetry fields
+    // Session and Telemetry fields
     public private(set) var isConnected: Bool = false
     public private(set) var frameCount: Int = 0
+    public private(set) var sessionCount: Int = 0
+    public private(set) var sessionFrameCount: Int = 0
+    private var sessionActive: Bool = false
+    private var sessionLastSequence: UInt32 = 0
+
     public private(set) var lastSequence: UInt32 = 0
     public private(set) var lastWidth: UInt32 = 0
     public private(set) var lastHeight: UInt32 = 0
@@ -76,66 +142,7 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
     private init() {}
 
-    /// Consumes a single byte from the UART Data Register.
-    /// Returns `true` if the byte was absorbed as part of a binary frame transport packet.
-    /// Returns `false` if the byte is normal console output.
-    public func consumeByte(_ byte: UInt8) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        switch state {
-        case .idle:
-            // Match the 8 magic bytes: "FLXFTRAN"
-            if byte == Self.magicBytes[magicBuffer.count] {
-                magicBuffer.append(byte)
-                if magicBuffer.count == Self.magicBytes.count {
-                    // Magic detected! Switch to receiving the rest of the 60-byte header
-                    state = .header
-                    headerBuffer = magicBuffer
-                    magicBuffer.removeAll(keepingCapacity: true)
-                    return true
-                }
-                return true
-            } else {
-                // Not matching next expected magic byte.
-                magicBuffer.removeAll(keepingCapacity: true)
-                if byte == Self.magicBytes[0] {
-                    magicBuffer.append(byte)
-                    return true
-                }
-                return false
-            }
-
-        case .header:
-            headerBuffer.append(byte)
-            if headerBuffer.count == 60 {
-                if let hdr = FluxFrameTransportHeader(bytes: headerBuffer) {
-                    currentHeader = hdr
-                    expectedPayloadSize = Int(hdr.dataSize)
-                    payloadBuffer.removeAll(keepingCapacity: true)
-                    payloadBuffer.reserveCapacity(expectedPayloadSize)
-                    state = .payload
-                } else {
-                    // Invalid header, reset
-                    state = .idle
-                    headerBuffer.removeAll(keepingCapacity: true)
-                }
-            }
-            return true
-
-        case .payload:
-            payloadBuffer.append(byte)
-            if payloadBuffer.count == expectedPayloadSize {
-                processCompletedPayload()
-                state = .idle
-                headerBuffer.removeAll(keepingCapacity: true)
-                currentHeader = nil
-            }
-            return true
-        }
-    }
-
-    /// Consumes a block of bytes from a transport buffer (VirtIO, NVMe, or memory).
+    /// Consumes a block of bytes from the verified transport stream channel (NSID 2 writes).
     public func consumeBytes(_ ptr: UnsafeRawPointer, count: Int) {
         guard count > 0 else { return }
         lock.lock()
@@ -172,6 +179,21 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
                 if headerBuffer.count == 60 {
                     if let hdr = FluxFrameTransportHeader(bytes: headerBuffer) {
+                        // Sequence monotonicity and session handling:
+                        if hdr.sequence == 1 {
+                            // Driver session started or reconnected
+                            sessionActive = true
+                            sessionCount += 1
+                            sessionFrameCount = 0
+                            sessionLastSequence = 0
+                            print("📸 [FRAME-TRANSPORT] Session #\(sessionCount) started (seq=1)")
+                        } else if !sessionActive || hdr.sequence <= sessionLastSequence {
+                            print("⚠️ [FRAME-TRANSPORT] Rejected non-monotonic sequence \(hdr.sequence) in session #\(sessionCount) (expected > \(sessionLastSequence))")
+                            state = .idle
+                            headerBuffer.removeAll(keepingCapacity: true)
+                            continue
+                        }
+
                         currentHeader = hdr
                         expectedPayloadSize = Int(hdr.dataSize)
                         payloadBuffer.removeAll(keepingCapacity: true)
@@ -220,26 +242,33 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
         if payloadBuffer.count >= 4 {
             payloadBuffer.withUnsafeBytes { raw in
-                p0 = raw.load(fromByteOffset: 0, as: UInt32.self)
+                p0 = raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
                 let centerOffset = (height / 2) * stride + (width / 2) * 4
                 if centerOffset + 4 <= payloadBuffer.count {
-                    pCenter = raw.load(fromByteOffset: centerOffset, as: UInt32.self)
+                    pCenter = raw.loadUnaligned(fromByteOffset: centerOffset, as: UInt32.self)
                 }
                 let lastOffset = (height - 1) * stride + (width - 1) * 4
                 if lastOffset + 4 <= payloadBuffer.count {
-                    pLast = raw.load(fromByteOffset: lastOffset, as: UInt32.self)
+                    pLast = raw.loadUnaligned(fromByteOffset: lastOffset, as: UInt32.self)
                 }
             }
         }
 
         let checksumMatches = (calculatedChecksum == hdr.checksum)
-        let dimensionsValid = (hdr.width == 800 && hdr.height == 600 && hdr.dataSize == 1920000)
-        let sequenceIncreasing = sequenceHistory.isEmpty || (hdr.sequence > sequenceHistory.last!)
+        let pixelsMatch = (p0 == hdr.pixel0 && pCenter == hdr.pixelCenter && pLast == hdr.pixelLast)
+        let isValid = checksumMatches && pixelsMatch
 
-        let isValid = checksumMatches && dimensionsValid && sequenceIncreasing
+        guard isValid else {
+            lastFrameValid = false
+            print("⚠️ [FRAME-TRANSPORT] Integrity check failed for seq=\(hdr.sequence): checksumMatch=\(checksumMatches) (calc=0x\(String(calculatedChecksum, radix: 16)), hdr=0x\(String(hdr.checksum, radix: 16))), pixelsMatch=\(pixelsMatch); discarding frame")
+            writeStatusReport()
+            return
+        }
 
         isConnected = true
         frameCount += 1
+        sessionFrameCount += 1
+        sessionLastSequence = hdr.sequence
         lastSequence = hdr.sequence
         sequenceHistory.append(hdr.sequence)
         lastWidth = hdr.width
@@ -251,10 +280,10 @@ public final class FluxFrameTransport: @unchecked Sendable {
         lastPixel0 = p0
         lastPixelCenter = pCenter
         lastPixelLast = pLast
-        lastFrameValid = isValid
+        lastFrameValid = true
         latestFrameData = Data(payloadBuffer)
 
-        print("📸 [FRAME-TRANSPORT] Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), stride=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), P0=0x\(String(p0, radix: 16)), PC=0x\(String(pCenter, radix: 16)), PL=0x\(String(pLast, radix: 16)) valid=\(isValid)")
+        print("📸 [FRAME-TRANSPORT] Session #\(sessionCount) Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), stride=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), P0=0x\(String(p0, radix: 16)), PC=0x\(String(pCenter, radix: 16)), PL=0x\(String(pLast, radix: 16)) valid=true")
 
         writeStatusReport()
     }
@@ -263,8 +292,9 @@ public final class FluxFrameTransport: @unchecked Sendable {
     public func writeStatusReport() {
         let appDir = FluxVM.defaultAppDirectory()
         let reportPath = appDir + "/flux_frame_transport_report.txt"
+        let localReportPath = FileManager.default.currentDirectoryPath + "/flux_frame_transport_report.txt"
 
-        var lines = [
+        let lines = [
             "FRAME_TRANSPORT_CONNECTED=" + (isConnected ? "YES" : "NO"),
             "FRAME_TRANSPORT_SEQUENCE=\(lastSequence)",
             "FRAME_TRANSPORT_WIDTH=\(lastWidth)",
@@ -272,6 +302,8 @@ public final class FluxFrameTransport: @unchecked Sendable {
             "FRAME_TRANSPORT_FORMAT=\(lastFormat)",
             "FRAME_TRANSPORT_DATA_SIZE=\(lastDataSize)",
             "FRAME_TRANSPORT_FRAME_COUNT=\(frameCount)",
+            "FRAME_TRANSPORT_SESSION_COUNT=\(sessionCount)",
+            "FRAME_TRANSPORT_SESSION_FRAME_COUNT=\(sessionFrameCount)",
             "FRAME_TRANSPORT_LAST_FRAME_VALID=" + (lastFrameValid ? "YES" : "NO"),
             "FRAME_CHECKSUM=0x" + String(format: "%08X", lastChecksum),
             "PIXEL_0=0x" + String(format: "%08X", lastPixel0),
@@ -282,6 +314,7 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
         let content = lines.joined(separator: "\r\n") + "\r\n"
         try? content.write(toFile: reportPath, atomically: true, encoding: .utf8)
+        try? content.write(toFile: localReportPath, atomically: true, encoding: .utf8)
     }
 
     /// Formats the current report string.
@@ -297,6 +330,8 @@ public final class FluxFrameTransport: @unchecked Sendable {
         FRAME_TRANSPORT_FORMAT=\(lastFormat)
         FRAME_TRANSPORT_DATA_SIZE=\(lastDataSize)
         FRAME_TRANSPORT_FRAME_COUNT=\(frameCount)
+        FRAME_TRANSPORT_SESSION_COUNT=\(sessionCount)
+        FRAME_TRANSPORT_SESSION_FRAME_COUNT=\(sessionFrameCount)
         FRAME_TRANSPORT_LAST_FRAME_VALID=\(lastFrameValid ? "YES" : "NO")
         FRAME_CHECKSUM=0x\(String(format: "%08X", lastChecksum))
         PIXEL_0=0x\(String(format: "%08X", lastPixel0))
