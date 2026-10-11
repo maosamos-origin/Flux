@@ -1,10 +1,18 @@
 import Foundation
 
-/// Frame transport protocol header (60 bytes packed, little-endian).
-/// Matches the C++ struct FluxFrameTransportHeader in SwapChain.cpp.
+/// Frame transport header (60 bytes packed, little-endian), shared with
+/// `Guest/Windows/FluxIdd/SwapChain.cpp`.
+///
+/// v1 byte layout: 0 magic[8], 8 version, 12 sequence, 16 width, 20 height,
+/// 24 RowPitch, 28 DXGI format, 32 payload length, 36 READY status,
+/// 40 additive checksum, 44/48/52 pixel samples, and 56 reserved=0.
+/// v2 keeps the binary size/layout so old storage allocations remain valid;
+/// byte 56 is CRC-32C/ISCSI of exactly the mapped payload bytes.
 public struct FluxFrameTransportHeader {
     public static let magicValue: UInt64 = 0x4E41525446584C46 // "FLXFTRAN" in little-endian
-    public static let expectedVersion: UInt32 = 1
+    public static let headerSize = 60
+    public static let legacyVersion: UInt32 = 1
+    public static let diagnosticVersion: UInt32 = 2
     public static let statusReady: UInt32 = 2
     public static let formatBGRA8: UInt32 = 87 // DXGI_FORMAT_B8G8R8A8_UNORM
 
@@ -40,13 +48,15 @@ extension FluxFrameTransportHeader {
     /// Strictly validates all header fields before returning a valid header instance.
     /// Rejects any header with invalid magic, version, format, dimensions, stride, or payload size.
     public init?(bytes: [UInt8]) {
-        guard bytes.count >= 60 else { return nil }
+        guard bytes.count >= Self.headerSize else { return nil }
         guard let hdr = bytes.withUnsafeBytes({ raw -> FluxFrameTransportHeader? in
             let m = raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
             guard m == Self.magicValue else { return nil }
 
             let v = raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self)
-            guard v == Self.expectedVersion else { return nil }
+            // Explicitly recognize v1 and v2.  Unknown versions are rejected
+            // before interpreting any payload fields.
+            guard v == Self.legacyVersion || v == Self.diagnosticVersion else { return nil }
 
             let seq = raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self)
             guard seq > 0 else { return nil }
@@ -99,6 +109,14 @@ extension FluxFrameTransportHeader {
     }
 }
 
+private struct FluxNVMeWriteDiagnostic {
+    let ordinal: UInt64
+    let offset: UInt64
+    let length: Int
+    let overlapsPrior: Bool
+    let duplicatesPrior: Bool
+}
+
 /// Receives, validates, and stores frames transferred from the Windows guest via the transport stream.
 public final class FluxFrameTransport: @unchecked Sendable {
     public static let shared = FluxFrameTransport()
@@ -117,6 +135,20 @@ public final class FluxFrameTransport: @unchecked Sendable {
     private var payloadBuffer: [UInt8] = []
     private var currentHeader: FluxFrameTransportHeader?
     private var expectedPayloadSize: Int = 0
+    private var currentAssemblyWriteOrdinals: [UInt64] = []
+    private var currentAssemblyRanges: [(offset: UInt64, length: Int)] = []
+    private var currentAssemblyOverlap = false
+    private var currentAssemblyDuplicate = false
+    private var currentAssemblyNonContiguous = false
+    private static let maximumRecordedWrites = 64
+    private var recentNVMeWrites: [FluxNVMeWriteDiagnostic] = []
+    private var nvmeWriteCount: UInt64 = 0
+    private var nvmeWriteOverlapCount: UInt64 = 0
+    private var nvmeWriteDuplicateCount: UInt64 = 0
+    private var nvmeWriteNonMonotonicCount: UInt64 = 0
+    private var lastNVMeWriteOffset: UInt64?
+    private var rejectedHeaderCount: UInt64 = 0
+    private var rejectedFrameCount: UInt64 = 0
 
     // Magic bytes: "FLXFTRAN"
     public static let magicBytes: [UInt8] = [
@@ -139,6 +171,13 @@ public final class FluxFrameTransport: @unchecked Sendable {
     public private(set) var lastFormat: String = "UNKNOWN"
     public private(set) var lastDataSize: Int = 0
     public private(set) var lastChecksum: UInt32 = 0
+    public private(set) var lastCRC32C: UInt32 = 0
+    public private(set) var lastCRC32CMatches: Bool = false
+    public private(set) var lastProtocolVersion: UInt32 = 0
+    public private(set) var lastAssemblyWriteCount: Int = 0
+    public private(set) var lastAssemblyHadOverlap: Bool = false
+    public private(set) var lastAssemblyHadDuplicate: Bool = false
+    public private(set) var lastAssemblyHadNonContiguousRange: Bool = false
     public private(set) var lastPixel0: UInt32 = 0
     public private(set) var lastPixelCenter: UInt32 = 0
     public private(set) var lastPixelLast: UInt32 = 0
@@ -148,8 +187,49 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
     private init() {}
 
+    /// CRC-32C/ISCSI over the exact transmitted byte sequence: reflected
+    /// Castagnoli polynomial 0x82F63B78, init/final XOR 0xFFFFFFFF.
+    /// `123456789` must evaluate to 0xE3069283 on both Windows and macOS.
+    public static func crc32c(_ bytes: [UInt8]) -> UInt32 {
+        var crc: UInt32 = 0xFFFF_FFFF
+        for byte in bytes {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0x82F6_3B78 : 0)
+            }
+        }
+        return crc ^ 0xFFFF_FFFF
+    }
+
+    public static func crc32cTestVectorPasses() -> Bool {
+        crc32c(Array("123456789".utf8)) == 0xE306_9283
+    }
+
+    /// Records physical namespace-2 ranges before their bytes are parsed.  FAT
+    /// overwrites may legitimately overlap, so this is diagnostic evidence and
+    /// never by itself causes a frame rejection.
+    public func recordNVMeWrite(offset: UInt64, length: Int, ordinal: UInt64) {
+        guard length > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        let end = offset &+ UInt64(length)
+        let overlaps = recentNVMeWrites.contains { prior in
+            let priorEnd = prior.offset &+ UInt64(prior.length)
+            return offset < priorEnd && prior.offset < end
+        }
+        let duplicates = recentNVMeWrites.contains { $0.offset == offset && $0.length == length }
+        nvmeWriteCount &+= 1
+        if overlaps { nvmeWriteOverlapCount &+= 1 }
+        if duplicates { nvmeWriteDuplicateCount &+= 1 }
+        if let last = lastNVMeWriteOffset, offset < last { nvmeWriteNonMonotonicCount &+= 1 }
+        lastNVMeWriteOffset = offset
+        recentNVMeWrites.append(.init(ordinal: ordinal, offset: offset, length: length,
+                                      overlapsPrior: overlaps, duplicatesPrior: duplicates))
+        if recentNVMeWrites.count > Self.maximumRecordedWrites { recentNVMeWrites.removeFirst() }
+    }
+
     /// Consumes a block of bytes from the verified transport stream channel (NSID 2 writes).
-    public func consumeBytes(_ ptr: UnsafeRawPointer, count: Int) {
+    public func consumeBytes(_ ptr: UnsafeRawPointer, count: Int, sourceOffset: UInt64 = 0, writeOrdinal: UInt64 = 0) {
         guard count > 0 else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -177,13 +257,13 @@ public final class FluxFrameTransport: @unchecked Sendable {
                 }
 
             case .header:
-                let needed = 60 - headerBuffer.count
+                let needed = FluxFrameTransportHeader.headerSize - headerBuffer.count
                 let available = count - offset
                 let toCopy = (needed < available) ? needed : available
                 headerBuffer.append(contentsOf: UnsafeBufferPointer(start: raw + offset, count: toCopy))
                 offset += toCopy
 
-                if headerBuffer.count == 60 {
+                if headerBuffer.count == FluxFrameTransportHeader.headerSize {
                     if let hdr = FluxFrameTransportHeader(bytes: headerBuffer) {
                         // Sequence monotonicity and session handling:
                         if hdr.sequence == 1 {
@@ -204,8 +284,14 @@ public final class FluxFrameTransport: @unchecked Sendable {
                         expectedPayloadSize = Int(hdr.dataSize)
                         payloadBuffer.removeAll(keepingCapacity: true)
                         payloadBuffer.reserveCapacity(expectedPayloadSize)
+                        currentAssemblyWriteOrdinals.removeAll(keepingCapacity: true)
+                        currentAssemblyRanges.removeAll(keepingCapacity: true)
+                        currentAssemblyOverlap = false
+                        currentAssemblyDuplicate = false
+                        currentAssemblyNonContiguous = false
                         state = .payload
                     } else {
+                        rejectedHeaderCount &+= 1
                         state = .idle
                         headerBuffer.removeAll(keepingCapacity: true)
                     }
@@ -214,10 +300,10 @@ public final class FluxFrameTransport: @unchecked Sendable {
             case .payload:
                 // Check if a new frame header arrived early at this block boundary
                 // (e.g. previous frame truncated, guest aborted, or fresh frame started)
-                if (count - offset) >= 60 {
+                if (count - offset) >= FluxFrameTransportHeader.headerSize {
                     let peekMagic = UnsafeRawPointer(raw + offset).loadUnaligned(as: UInt64.self)
                     if peekMagic == FluxFrameTransportHeader.magicValue {
-                        let candidateBytes = Array(UnsafeBufferPointer(start: raw + offset, count: 60))
+                        let candidateBytes = Array(UnsafeBufferPointer(start: raw + offset, count: FluxFrameTransportHeader.headerSize))
                         if let newHdr = FluxFrameTransportHeader(bytes: candidateBytes) {
                             if newHdr.sequence == 1 || (sessionActive && newHdr.sequence > sessionLastSequence) {
                                 print("⚠️ [FRAME-TRANSPORT] New frame header seq=\(newHdr.sequence) arrived early while in payload (have \(payloadBuffer.count)/\(expectedPayloadSize)); resynchronizing")
@@ -235,6 +321,23 @@ public final class FluxFrameTransport: @unchecked Sendable {
                 let needed = expectedPayloadSize - payloadBuffer.count
                 let available = count - offset
                 let toCopy = (needed < available) ? needed : available
+                if writeOrdinal != 0 && toCopy > 0 {
+                    let segmentOffset = sourceOffset &+ UInt64(offset)
+                    if let previous = currentAssemblyRanges.last,
+                       previous.offset &+ UInt64(previous.length) != segmentOffset {
+                        // FAT may place clusters non-contiguously.  Preserve
+                        // this as evidence rather than rejecting a valid frame.
+                        currentAssemblyNonContiguous = true
+                    }
+                    currentAssemblyWriteOrdinals.append(writeOrdinal)
+                    currentAssemblyRanges.append((segmentOffset, toCopy))
+                    if currentAssemblyWriteOrdinals.count > Self.maximumRecordedWrites { currentAssemblyWriteOrdinals.removeFirst() }
+                    if currentAssemblyRanges.count > Self.maximumRecordedWrites { currentAssemblyRanges.removeFirst() }
+                    if let write = recentNVMeWrites.last(where: { $0.ordinal == writeOrdinal }) {
+                        currentAssemblyOverlap = currentAssemblyOverlap || write.overlapsPrior
+                        currentAssemblyDuplicate = currentAssemblyDuplicate || write.duplicatesPrior
+                    }
+                }
                 payloadBuffer.append(contentsOf: UnsafeBufferPointer(start: raw + offset, count: toCopy))
                 offset += toCopy
 
@@ -256,6 +359,13 @@ public final class FluxFrameTransport: @unchecked Sendable {
         for b in payloadBuffer {
             calculatedChecksum &+= UInt32(b)
         }
+
+        // v2 protects byte ordering, unlike the additive v1 checksum.  v1
+        // remains accepted for compatibility but is explicitly identified in
+        // reports; unknown versions were rejected before payload acceptance.
+        let calculatedCRC32C = Self.crc32c(payloadBuffer)
+        let crc32cMatches = hdr.version == FluxFrameTransportHeader.legacyVersion ||
+            calculatedCRC32C == hdr.reserved
 
         // 2. Sample pixels
         let stride = Int(hdr.stride)
@@ -282,11 +392,12 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
         let checksumMatches = (calculatedChecksum == hdr.checksum)
         let pixelsMatch = (p0 == hdr.pixel0 && pCenter == hdr.pixelCenter && pLast == hdr.pixelLast)
-        let isValid = checksumMatches && pixelsMatch
+        let isValid = checksumMatches && pixelsMatch && crc32cMatches
 
         guard isValid else {
             lastFrameValid = false
-            print("⚠️ [FRAME-TRANSPORT] Integrity check failed for seq=\(hdr.sequence): checksumMatch=\(checksumMatches) (calc=0x\(String(calculatedChecksum, radix: 16)), hdr=0x\(String(hdr.checksum, radix: 16))), pixelsMatch=\(pixelsMatch); discarding frame")
+            rejectedFrameCount &+= 1
+            print("⚠️ [FRAME-TRANSPORT] Integrity check failed for v\(hdr.version) seq=\(hdr.sequence): checksumMatch=\(checksumMatches) crc32cMatch=\(crc32cMatches) (calc=0x\(String(calculatedCRC32C, radix: 16)), hdr=0x\(String(hdr.reserved, radix: 16))) pixelsMatch=\(pixelsMatch); discarding frame")
             writeStatusReport()
             return
         }
@@ -303,6 +414,13 @@ public final class FluxFrameTransport: @unchecked Sendable {
         lastFormat = (hdr.pixelFormat == 87) ? "BGRA8" : "FORMAT_\(hdr.pixelFormat)"
         lastDataSize = payloadBuffer.count
         lastChecksum = calculatedChecksum
+        lastCRC32C = calculatedCRC32C
+        lastCRC32CMatches = crc32cMatches
+        lastProtocolVersion = hdr.version
+        lastAssemblyWriteCount = currentAssemblyWriteOrdinals.count
+        lastAssemblyHadOverlap = currentAssemblyOverlap
+        lastAssemblyHadDuplicate = currentAssemblyDuplicate
+        lastAssemblyHadNonContiguousRange = currentAssemblyNonContiguous
         lastPixel0 = p0
         lastPixelCenter = pCenter
         lastPixelLast = pLast
@@ -311,7 +429,7 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
         FluxDisplayManager.shared.updateActiveResolution(width: Int(hdr.width), height: Int(hdr.height))
 
-        print("📸 [FRAME-TRANSPORT] Session #\(sessionCount) Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), stride=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), P0=0x\(String(p0, radix: 16)), PC=0x\(String(pCenter, radix: 16)), PL=0x\(String(pLast, radix: 16)) valid=true")
+        print("📸 [FRAME-TRANSPORT] v\(hdr.version) Session #\(sessionCount) Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), rowPitch=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), crc32c=0x\(String(calculatedCRC32C, radix: 16)), writes=\(currentAssemblyWriteOrdinals.count), overlap=\(currentAssemblyOverlap), duplicate=\(currentAssemblyDuplicate), noncontiguous=\(currentAssemblyNonContiguous) valid=true")
 
         writeStatusReport()
     }
@@ -369,8 +487,11 @@ public final class FluxFrameTransport: @unchecked Sendable {
         let appDir = FluxVM.defaultAppDirectory()
         let reportPath = appDir + "/flux_frame_transport_report.txt"
         let localReportPath = FileManager.default.currentDirectoryPath + "/flux_frame_transport_report.txt"
+        let recentWrites = recentNVMeWrites.map { write in
+            "#\(write.ordinal)@0x\(String(write.offset, radix: 16))+\(write.length) overlap=\(write.overlapsPrior ? 1 : 0) duplicate=\(write.duplicatesPrior ? 1 : 0)"
+        }.joined(separator: ";")
 
-        let lines = [
+        let frameLines: [String] = [
             "FRAME_TRANSPORT_CONNECTED=" + (isConnected ? "YES" : "NO"),
             "FRAME_TRANSPORT_SEQUENCE=\(lastSequence)",
             "FRAME_TRANSPORT_WIDTH=\(lastWidth)",
@@ -381,16 +502,33 @@ public final class FluxFrameTransport: @unchecked Sendable {
             "FRAME_TRANSPORT_SESSION_COUNT=\(sessionCount)",
             "FRAME_TRANSPORT_SESSION_FRAME_COUNT=\(sessionFrameCount)",
             "FRAME_TRANSPORT_LAST_FRAME_VALID=" + (lastFrameValid ? "YES" : "NO"),
+            "FRAME_TRANSPORT_PROTOCOL_VERSION=\(lastProtocolVersion)",
+            "FRAME_TRANSPORT_REJECTED_HEADERS=\(rejectedHeaderCount)",
+            "FRAME_TRANSPORT_REJECTED_FRAMES=\(rejectedFrameCount)",
             "FRAME_CHECKSUM=0x" + String(format: "%08X", lastChecksum),
+            "FRAME_CRC32C=0x" + String(format: "%08X", lastCRC32C),
+            "FRAME_CRC32C_MATCH=" + (lastCRC32CMatches ? "YES" : "NO"),
+            "FRAME_ASSEMBLY_WRITE_COUNT=\(lastAssemblyWriteCount)",
+            "FRAME_ASSEMBLY_OVERLAP=" + (lastAssemblyHadOverlap ? "YES" : "NO"),
+            "FRAME_ASSEMBLY_DUPLICATE=" + (lastAssemblyHadDuplicate ? "YES" : "NO"),
+            "FRAME_ASSEMBLY_NONCONTIGUOUS=" + (lastAssemblyHadNonContiguousRange ? "YES" : "NO"),
             "PIXEL_0=0x" + String(format: "%08X", lastPixel0),
             "PIXEL_CENTER=0x" + String(format: "%08X", lastPixelCenter),
-            "PIXEL_LAST=0x" + String(format: "%08X", lastPixelLast),
+            "PIXEL_LAST=0x" + String(format: "%08X", lastPixelLast)
+        ]
+        let nvmeLines: [String] = [
+            "NVME_TRANSPORT_WRITE_COUNT=\(nvmeWriteCount)",
+            "NVME_TRANSPORT_OVERLAP_COUNT=\(nvmeWriteOverlapCount)",
+            "NVME_TRANSPORT_DUPLICATE_COUNT=\(nvmeWriteDuplicateCount)",
+            "NVME_TRANSPORT_NONMONOTONIC_COUNT=\(nvmeWriteNonMonotonicCount)",
+            "NVME_TRANSPORT_RECENT_WRITES=" + recentWrites,
             "SEQUENCE_HISTORY=" + sequenceHistory.map { String($0) }.joined(separator: ","),
             "RENDERED_FRAME_COUNT=\(renderedFrameCount)",
             "UNIQUE_FRAMES_PRESENTED=\(uniqueFramesPresentedCount)",
             "RENDERED_SOURCE=\(activeRenderSource)",
             "LAST_RENDERED_SEQUENCE=\(lastRenderedSequence)"
         ]
+        let lines = frameLines + nvmeLines
 
         let content = lines.joined(separator: "\r\n") + "\r\n"
         try? content.write(toFile: reportPath, atomically: true, encoding: .utf8)
@@ -413,10 +551,23 @@ public final class FluxFrameTransport: @unchecked Sendable {
         FRAME_TRANSPORT_SESSION_COUNT=\(sessionCount)
         FRAME_TRANSPORT_SESSION_FRAME_COUNT=\(sessionFrameCount)
         FRAME_TRANSPORT_LAST_FRAME_VALID=\(lastFrameValid ? "YES" : "NO")
+        FRAME_TRANSPORT_PROTOCOL_VERSION=\(lastProtocolVersion)
+        FRAME_TRANSPORT_REJECTED_HEADERS=\(rejectedHeaderCount)
+        FRAME_TRANSPORT_REJECTED_FRAMES=\(rejectedFrameCount)
         FRAME_CHECKSUM=0x\(String(format: "%08X", lastChecksum))
+        FRAME_CRC32C=0x\(String(format: "%08X", lastCRC32C))
+        FRAME_CRC32C_MATCH=\(lastCRC32CMatches ? "YES" : "NO")
+        FRAME_ASSEMBLY_WRITE_COUNT=\(lastAssemblyWriteCount)
+        FRAME_ASSEMBLY_OVERLAP=\(lastAssemblyHadOverlap ? "YES" : "NO")
+        FRAME_ASSEMBLY_DUPLICATE=\(lastAssemblyHadDuplicate ? "YES" : "NO")
+        FRAME_ASSEMBLY_NONCONTIGUOUS=\(lastAssemblyHadNonContiguousRange ? "YES" : "NO")
         PIXEL_0=0x\(String(format: "%08X", lastPixel0))
         PIXEL_CENTER=0x\(String(format: "%08X", lastPixelCenter))
         PIXEL_LAST=0x\(String(format: "%08X", lastPixelLast))
+        NVME_TRANSPORT_WRITE_COUNT=\(nvmeWriteCount)
+        NVME_TRANSPORT_OVERLAP_COUNT=\(nvmeWriteOverlapCount)
+        NVME_TRANSPORT_DUPLICATE_COUNT=\(nvmeWriteDuplicateCount)
+        NVME_TRANSPORT_NONMONOTONIC_COUNT=\(nvmeWriteNonMonotonicCount)
         SEQUENCE_HISTORY=\(sequenceHistory.map { String($0) }.joined(separator: ","))
         RENDERED_FRAME_COUNT=\(renderedFrameCount)
         UNIQUE_FRAMES_PRESENTED=\(uniqueFramesPresentedCount)

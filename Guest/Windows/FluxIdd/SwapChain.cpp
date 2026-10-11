@@ -35,7 +35,10 @@ using Microsoft::WRL::ComPtr;
 #pragma pack(push, 1)
 struct FluxFrameTransportHeader {
     char magic[8];          // "FLXFTRAN"
-    UINT32 version;         // 1
+    // v1 and v2 intentionally remain 60 bytes packed.  See the host parser
+    // for the byte offsets.  v2 uses `reserved` as CRC32C of exactly the
+    // `dataSize` mapped bytes which follow this header.
+    UINT32 version;         // 1 (legacy) or 2 (CRC32C diagnostic protocol)
     UINT32 sequence;        // 1, 2, 3...
     UINT32 width;           // 800
     UINT32 height;          // 600
@@ -47,9 +50,46 @@ struct FluxFrameTransportHeader {
     UINT32 pixel0;          // sample pixel at (0, 0)
     UINT32 pixelCenter;     // sample pixel at (width/2, height/2)
     UINT32 pixelLast;       // sample pixel at (width-1, height-1)
-    UINT32 reserved;        // 0
+    UINT32 reserved;        // v1: 0; v2: CRC32C (Castagnoli) of payload bytes
 };
 #pragma pack(pop)
+
+static_assert(sizeof(FluxFrameTransportHeader) == 60,
+              "Flux frame transport header layout changed");
+
+// CRC-32C/ISCSI: reflected Castagnoli polynomial 0x82F63B78, initial and
+// final XOR 0xFFFFFFFF.  The standard "123456789" test vector is E3069283.
+// The table is initialized once and is used over the bytes exactly as mapped
+// by D3D11 (including any RowPitch padding), matching the macOS receiver.
+static UINT32 FluxCrc32c(const BYTE* data, size_t length) {
+    static UINT32 table[256] = {};
+    static volatile LONG tableState = 0; // 0 = uninitialized, 1 = building, 2 = ready
+    if (InterlockedCompareExchange(&tableState, 1, 0) == 0) {
+        for (UINT32 i = 0; i < 256; ++i) {
+            UINT32 value = i;
+            for (UINT32 bit = 0; bit < 8; ++bit) {
+                value = (value >> 1) ^ ((value & 1) ? 0x82F63B78u : 0u);
+            }
+            table[i] = value;
+        }
+        InterlockedExchange(&tableState, 2);
+    } else {
+        while (InterlockedCompareExchange(&tableState, 2, 2) != 2) {
+            YieldProcessor();
+        }
+    }
+
+    UINT32 crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < length; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static bool FluxCrc32cTestVectorPasses() {
+    static const BYTE kVector[] = {'1','2','3','4','5','6','7','8','9'};
+    return FluxCrc32c(kVector, sizeof(kVector)) == 0xE3069283u;
+}
 
 struct SwapChainSession final {
     volatile LONG refCount;
@@ -83,6 +123,7 @@ struct SwapChainSession final {
     volatile LONG lastTransmittedP0;
     volatile LONG lastTransmittedPC;
     volatile LONG lastTransmittedPL;
+    volatile LONG lastTransmittedCRC32C;
     ULONGLONG lastTransmittedTick;
 };
 
@@ -119,6 +160,7 @@ static SwapChainSession* CreateSwapChainSession() {
         s->lastTransmittedP0 = 0;
         s->lastTransmittedPC = 0;
         s->lastTransmittedPL = 0;
+        s->lastTransmittedCRC32C = 0;
         s->lastTransmittedTick = 0;
     }
     return s;
@@ -285,6 +327,10 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
     }
 
     OutputDebugStringA("FluxIdd: FluxIddWorkerThread entered\n");
+    if (!FluxCrc32cTestVectorPasses()) {
+        OutputDebugStringA("FluxIdd: CRC32C self-test failed; frame transport disabled\n");
+        SetEvent(session->hTerminateEvent);
+    }
 
     IDDCX_SWAPCHAIN hSwapChain = session->hSwapChain;
     // hTerminateEvent placed at index 0 guarantees termination priority over hNextSurfaceAvailable at index 1
@@ -486,6 +532,12 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                     HRESULT mapHr = d3dContext->Map(session->stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
                     if (SUCCEEDED(mapHr)) {
                         UINT stride = mapped.RowPitch;
+                        if (format != DXGI_FORMAT_B8G8R8A8_UNORM || stride < width * 4 ||
+                            height == 0 || stride > (0xFFFFFFFFu / height)) {
+                            OutputDebugStringA("FluxIdd: FRAME_TRANSPORT rejected invalid mapped BGRA8 layout\n");
+                            d3dContext->Unmap(session->stagingTexture.Get(), 0);
+                            continue;
+                        }
                         UINT dataSize = stride * height;
                         const BYTE* pSrc = static_cast<const BYTE*>(mapped.pData);
 
@@ -493,6 +545,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         for (UINT i = 0; i < dataSize; ++i) {
                             checksum += pSrc[i];
                         }
+                        const UINT32 crc32c = FluxCrc32c(pSrc, dataSize);
 
                         UINT32 p0 = (dataSize >= 4) ? *reinterpret_cast<const UINT32*>(pSrc) : 0;
                         UINT centerOff = (height / 2) * stride + (width / 2) * 4;
@@ -502,6 +555,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
 
                         ULONGLONG now = GetTickCount64();
                         bool contentChanged = (checksum != static_cast<UINT32>(session->lastTransmittedChecksum) ||
+                                               crc32c != static_cast<UINT32>(session->lastTransmittedCRC32C) ||
                                                p0 != static_cast<UINT32>(session->lastTransmittedP0) ||
                                                pCenter != static_cast<UINT32>(session->lastTransmittedPC) ||
                                                pLast != static_cast<UINT32>(session->lastTransmittedPL));
@@ -509,6 +563,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                         // Transmit on desktop content change, on 1000ms heartbeat, or on initial frames
                         if (contentChanged || (now - session->lastTransmittedTick >= 1000) || session->transportFrameCount == 0) {
                             session->lastTransmittedChecksum = static_cast<LONG>(checksum);
+                            session->lastTransmittedCRC32C = static_cast<LONG>(crc32c);
                             session->lastTransmittedP0 = static_cast<LONG>(p0);
                             session->lastTransmittedPC = static_cast<LONG>(pCenter);
                             session->lastTransmittedPL = static_cast<LONG>(pLast);
@@ -519,7 +574,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                             FluxFrameTransportHeader hdr = {};
                             hdr.magic[0] = 'F'; hdr.magic[1] = 'L'; hdr.magic[2] = 'X'; hdr.magic[3] = 'F';
                             hdr.magic[4] = 'T'; hdr.magic[5] = 'R'; hdr.magic[6] = 'A'; hdr.magic[7] = 'N';
-                            hdr.version = 1;
+                            hdr.version = 2;
                             hdr.sequence = static_cast<UINT32>(seq);
                             hdr.width = width;
                             hdr.height = height;
@@ -531,13 +586,16 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                             hdr.pixel0 = p0;
                             hdr.pixelCenter = pCenter;
                             hdr.pixelLast = pLast;
-                            hdr.reserved = 0;
+                            hdr.reserved = crc32c;
 
                             // Rewind to start of file to keep backing storage fixed at 1 frame (1.83 MB)
                             SetFilePointer(session->hTransportFile, 0, nullptr, FILE_BEGIN);
 
                             DWORD written = 0;
-                            WriteFile(session->hTransportFile, &hdr, sizeof(hdr), &written, nullptr);
+                            if (!WriteFile(session->hTransportFile, &hdr, sizeof(hdr), &written, nullptr) ||
+                                written != sizeof(hdr)) {
+                                OutputDebugStringA("FluxIdd: FRAME_TRANSPORT header write failed\n");
+                            }
 
                             const DWORD chunkSize = 65536;
                             DWORD offset = 0;
@@ -561,8 +619,8 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                                 if (seq == 1 || (seq % 30 == 0)) {
                                     char msg[256];
                                     sprintf_s(msg, sizeof(msg),
-                                        "FluxIdd: FRAME_TRANSPORT_SUCCESS seq=%ld width=%u height=%u size=%u checksum=0x%08X\n",
-                                        seq, width, height, dataSize, checksum);
+                                        "FluxIdd: FRAME_TRANSPORT_SUCCESS v2 seq=%ld width=%u height=%u rowPitch=%u size=%u checksum=0x%08X crc32c=0x%08X\n",
+                                        seq, width, height, stride, dataSize, checksum, crc32c);
                                     OutputDebugStringA(msg);
                                 }
                             }

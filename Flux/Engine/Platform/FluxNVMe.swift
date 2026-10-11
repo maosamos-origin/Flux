@@ -155,6 +155,11 @@ nonisolated final class FluxNVMe {
     private let ioGate = NSCondition()
     private var ioState: IOState = .disabled
     private var admittedHostIO: UInt64 = 0
+    /// Monotonic host-side order for NSID 2 writes.  This is diagnostic only;
+    /// it lets the frame transport distinguish write arrival order from FAT
+    /// physical offset order without changing I/O scheduling.
+    private let transportWriteOrdinalLock = NSLock()
+    private var nextTransportWriteOrdinal: UInt64 = 0
 
     private struct AsyncIORequest: @unchecked Sendable {
         let generation: UInt64
@@ -167,6 +172,7 @@ nonisolated final class FluxNVMe {
         let fileOffset: off_t
         let totalBytes: Int
         let iovs: [iovec]
+        let transportWriteOrdinal: UInt64
     }
 
     static var verbose: Bool = ProcessInfo.processInfo.environment["FLUX_VERBOSE_NVME"] == "1"
@@ -1543,6 +1549,12 @@ nonisolated final class FluxNVMe {
             let chunks = resolvePRP(prp1: prp1, prp2: prp2, totalBytes: totalBytes)
             let iovs = buildIOVecs(from: chunks)
 
+            let transportWriteOrdinal: UInt64
+            if nsid == 2 && opc == 0x01 {
+                transportWriteOrdinal = nextNS2TransportWriteOrdinal()
+            } else {
+                transportWriteOrdinal = 0
+            }
             let req = AsyncIORequest(
                 generation: controllerGeneration,
                 sqid: sqid,
@@ -1553,7 +1565,8 @@ nonisolated final class FluxNVMe {
                 fd: fd,
                 fileOffset: fileOffset,
                 totalBytes: totalBytes,
-                iovs: iovs
+                iovs: iovs,
+                transportWriteOrdinal: transportWriteOrdinal
             )
 
             let isBarrier = (opc == 0x00) || (nsid == 2 && opc == 0x01) // FLUSH and NSID 2 transport execute as barriers for strict chunk ordering
@@ -1562,6 +1575,13 @@ nonisolated final class FluxNVMe {
                 self.executeAsyncHostIO(req)
             }
         }
+    }
+
+    private func nextNS2TransportWriteOrdinal() -> UInt64 {
+        transportWriteOrdinalLock.lock()
+        defer { transportWriteOrdinalLock.unlock() }
+        nextTransportWriteOrdinal &+= 1
+        return nextTransportWriteOrdinal
     }
 
     /// Validates an NVMe data-command LBA range before byte arithmetic. The
@@ -1641,9 +1661,17 @@ nonisolated final class FluxNVMe {
                 // Verified designated channel for Frame Transport packets:
                 // Only feed data cluster writes (>= ns2DataOffset) to isolate filesystem metadata (FAT tables, directory, boot sector)
                 if req.fileOffset >= self.ns2DataOffset {
+                    FluxFrameTransport.shared.recordNVMeWrite(
+                        offset: UInt64(req.fileOffset), length: req.totalBytes,
+                        ordinal: req.transportWriteOrdinal)
+                    var iovOffset = 0
                     for iov in req.iovs {
                         if let base = iov.iov_base, iov.iov_len > 0 {
-                            FluxFrameTransport.shared.consumeBytes(base, count: iov.iov_len)
+                            FluxFrameTransport.shared.consumeBytes(
+                                base, count: iov.iov_len,
+                                sourceOffset: UInt64(req.fileOffset + off_t(iovOffset)),
+                                writeOrdinal: req.transportWriteOrdinal)
+                            iovOffset += iov.iov_len
                         }
                     }
                 }
@@ -1935,7 +1963,8 @@ nonisolated final class FluxNVMe {
                     fd: targetFD,
                     fileOffset: off_t(0x0010_0000 + ((resetNumber * 128 + requestNumber) % 128) * 4096),
                     totalBytes: 4096,
-                    iovs: [iovec(iov_base: data, iov_len: 4096)]
+                    iovs: [iovec(iov_base: data, iov_len: 4096)],
+                    transportWriteOrdinal: 0
                 )
                 group.enter()
                 workerPool.submit { [weak self] in
@@ -1959,7 +1988,8 @@ nonisolated final class FluxNVMe {
         let nsid2Request = AsyncIORequest(generation: controllerGeneration, sqid: 1, cqId: 1, cid: 0,
                                           opc: 0x01, nsid: 2, fd: targetFD,
                                           fileOffset: off_t(0x0020_0000), totalBytes: 4096,
-                                          iovs: [iovec(iov_base: data, iov_len: 4096)])
+                                          iovs: [iovec(iov_base: data, iov_len: 4096)],
+                                          transportWriteOrdinal: 0)
         enableIOGate()
         executeAsyncHostIO(nsid2Request)
         let nsid2Protected = nsid2Before == checksumTarget(offset: off_t(0x0020_0000))
