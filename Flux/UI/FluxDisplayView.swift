@@ -17,7 +17,7 @@ struct FluxDisplayView: NSViewRepresentable {
 
         mtkView.device = device
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = 60
+        mtkView.preferredFramesPerSecond = max(60, NSScreen.main?.maximumFramesPerSecond ?? 60)
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false
 
@@ -48,6 +48,10 @@ struct FluxDisplayView: NSViewRepresentable {
 internal final class FluxDiagnosticDisplayView: MTKView {
     static weak var current: FluxDiagnosticDisplayView?
 
+    static func toggleFullScreen() {
+        (current?.window ?? NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil)
+    }
+
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
@@ -72,14 +76,16 @@ internal final class FluxDiagnosticDisplayView: MTKView {
         trackingArea = area
     }
 
-    private var scrollAccumulator: CGFloat = 0.0
+    private var scrollAccumulator = FluxScrollAccumulator()
+    private var mouseButtons = FluxPointerButtonState()
 
     override func becomeFirstResponder() -> Bool {
         true
     }
 
     override func resignFirstResponder() -> Bool {
-        scrollAccumulator = 0.0
+        scrollAccumulator.reset()
+        mouseButtons.reset()
         FluxHIDKeyboard.shared.resetState()
         FluxHIDPointer.shared.resetButtons()
         return super.resignFirstResponder()
@@ -101,6 +107,8 @@ internal final class FluxDiagnosticDisplayView: MTKView {
             }
             setupKeyEventMonitor()
         } else {
+            mouseButtons.reset()
+            FluxHIDPointer.shared.resetButtons()
             if Self.current === self {
                 Self.current = nil
             }
@@ -125,6 +133,7 @@ internal final class FluxDiagnosticDisplayView: MTKView {
     }
 
     private func handleDebouncedWindowResize() {
+        guard FluxDisplayManager.shared.autoResizeEnabled else { return }
         let viewSize = bounds.size
         guard viewSize.width > 0 && viewSize.height > 0 else { return }
 
@@ -140,7 +149,8 @@ internal final class FluxDiagnosticDisplayView: MTKView {
 
     @objc private func windowDidResignKey() {
         print("🪟 [WINDOW-STATE] windowDidResignKey: isKey=\(window?.isKeyWindow ?? false) isMain=\(window?.isMainWindow ?? false) appActive=\(NSApp.isActive)")
-        scrollAccumulator = 0.0
+        scrollAccumulator.reset()
+        mouseButtons.reset()
         FluxHIDKeyboard.shared.resetState()
         FluxHIDPointer.shared.resetButtons()
     }
@@ -169,90 +179,110 @@ internal final class FluxDiagnosticDisplayView: MTKView {
 
     // MARK: - Native Mouse / Pointer Events
 
-    private func handleMouseEvent(_ event: NSEvent) {
-        let loc = convert(event.locationInWindow, from: nil)
+    private static let ramfbOverride =
+        ProcessInfo.processInfo.environment["FLUX_RENDER_SOURCE"]?.lowercased() == "ramfb"
+
+    private func activeFramebufferDimensions() -> (width: Int, height: Int) {
+        if !Self.ramfbOverride, let idd = FluxFrameTransport.shared.latestFrameMetadata() {
+            return (idd.width, idd.height)
+        }
         let snap = FluxFramebuffer.shared.snapshot()
-        let fbW = snap.width > 0 ? snap.width : 1024
-        let fbH = snap.height > 0 ? snap.height : 768
-        guard let map = FluxHIDPointer.mapPointToHID(viewPoint: loc, viewSize: bounds.size, fbWidth: fbW, fbHeight: fbH) else {
+        return (snap.width > 0 ? snap.width : 1024, snap.height > 0 ? snap.height : 768)
+    }
+
+    private func handleMouseEvent(_ event: NSEvent, reason: String) {
+        let loc = convert(event.locationInWindow, from: nil)
+        let dims = activeFramebufferDimensions()
+        guard let map = FluxHIDPointer.mapPointToHID(viewPoint: loc, viewSize: bounds.size, fbWidth: dims.width, fbHeight: dims.height, fillScreen: FluxDisplayManager.shared.fillScreen) else {
             return
         }
-        let buttons = UInt8(NSEvent.pressedMouseButtons & 0x07)
-        FluxHIDPointer.shared.updateState(x: map.hidX, y: map.hidY, buttons: buttons)
+        FluxHIDPointer.appendInputDiagnostic(
+            stage: "APPKIT",
+            detail: "event=\(reason) buttonNumber=\(event.buttonNumber) globalMask=0x\(String(NSEvent.pressedMouseButtons & 0x07, radix: 16)) ownedMask=0x\(String(mouseButtons.mask, radix: 16))"
+        )
+        FluxHIDPointer.shared.updateState(x: map.hidX, y: map.hidY, buttons: mouseButtons.mask)
     }
 
     override func mouseEntered(with event: NSEvent) {
-        handleMouseEvent(event)
+        if let window = self.window, window.isKeyWindow, window.firstResponder !== self {
+            window.makeFirstResponder(self)
+        }
+        handleMouseEvent(event, reason: "mouseEntered")
     }
 
     override func mouseExited(with event: NSEvent) {
-        if NSEvent.pressedMouseButtons == 0 {
-            FluxHIDPointer.shared.resetButtons()
-        }
+        // The originating view receives its matching mouseUp event even if a
+        // drag leaves the view. Preserve the event-owned mask here so a drag
+        // cannot lose its held button merely by crossing the viewport edge.
     }
 
     override func mouseMoved(with event: NSEvent) {
-        handleMouseEvent(event)
+        handleMouseEvent(event, reason: "mouseMoved")
     }
 
     override func mouseDragged(with event: NSEvent) {
-        handleMouseEvent(event)
+        handleMouseEvent(event, reason: "mouseDragged")
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        handleMouseEvent(event)
+        handleMouseEvent(event, reason: "rightMouseDragged")
     }
 
     override func otherMouseDragged(with event: NSEvent) {
-        handleMouseEvent(event)
+        handleMouseEvent(event, reason: "otherMouseDragged")
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        handleMouseEvent(event)
+        _ = mouseButtons.press(buttonNumber: 0)
+        handleMouseEvent(event, reason: "mouseDown")
     }
 
     override func mouseUp(with event: NSEvent) {
-        handleMouseEvent(event)
+        _ = mouseButtons.release(buttonNumber: 0)
+        handleMouseEvent(event, reason: "mouseUp")
     }
 
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        handleMouseEvent(event)
+        _ = mouseButtons.press(buttonNumber: 1)
+        handleMouseEvent(event, reason: "rightMouseDown")
     }
 
     override func rightMouseUp(with event: NSEvent) {
-        handleMouseEvent(event)
+        _ = mouseButtons.release(buttonNumber: 1)
+        handleMouseEvent(event, reason: "rightMouseUp")
     }
 
     override func otherMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        handleMouseEvent(event)
+        _ = mouseButtons.press(buttonNumber: event.buttonNumber)
+        handleMouseEvent(event, reason: "otherMouseDown")
     }
 
     override func otherMouseUp(with event: NSEvent) {
-        handleMouseEvent(event)
+        _ = mouseButtons.release(buttonNumber: event.buttonNumber)
+        handleMouseEvent(event, reason: "otherMouseUp")
     }
 
     override func scrollWheel(with event: NSEvent) {
-        if event.hasPreciseScrollingDeltas {
-            // Trackpad smooth scrolling
-            scrollAccumulator += event.scrollingDeltaY
-            let threshold: CGFloat = 8.0 // points per HID wheel tick
-            if abs(scrollAccumulator) >= threshold {
-                let steps = Int(scrollAccumulator / threshold)
-                scrollAccumulator -= CGFloat(steps) * threshold
-                let clampedDelta = Int8(clamping: max(-5, min(5, steps)))
-                if clampedDelta != 0 {
-                    FluxHIDPointer.shared.updateWheel(delta: clampedDelta)
-                }
-            }
-        } else {
-            // Traditional mouse wheel
-            let ticks = Int8(clamping: Int(round(event.deltaY)))
-            if ticks != 0 {
-                FluxHIDPointer.shared.updateWheel(delta: ticks)
-            }
+        // AppKit has already applied the user's natural-scroll preference to
+        // these deltas. Preserve it; do not synthesize gesture events or send
+        // an additional report for momentum phases.
+        let scroll = scrollAccumulator.consume(
+            deltaX: event.scrollingDeltaX,
+            deltaY: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas
+        )
+        if scroll.vertical != 0 || scroll.horizontal != 0 {
+            FluxHIDPointer.shared.updateScroll(vertical: scroll.vertical, horizontal: scroll.horizontal)
+        }
+
+        // Discard a fractional tail when a gesture is finished or cancelled so
+        // it cannot leak into the next independent trackpad gesture.
+        if event.phase.contains(.ended) || event.phase.contains(.cancelled) ||
+            event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) {
+            scrollAccumulator.reset()
         }
     }
 

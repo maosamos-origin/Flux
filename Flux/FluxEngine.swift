@@ -2,9 +2,14 @@ import Foundation
 
 nonisolated final class FluxEngine: Sendable {
 
+    private let activeVM = FluxVM()
+
     func testHypervisor(edition: String = "Windows 11 Pro") {
-        let vm = FluxVM()
-        vm.runTest(edition: edition)
+        activeVM.runTest(edition: edition)
+    }
+
+    func requestForceStop() {
+        activeVM.requestForceStop()
     }
 
     func runResetDiskValidation() -> Bool {

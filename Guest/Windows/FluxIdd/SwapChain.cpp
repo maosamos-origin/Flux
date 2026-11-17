@@ -597,7 +597,7 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                                 OutputDebugStringA("FluxIdd: FRAME_TRANSPORT header write failed\n");
                             }
 
-                            const DWORD chunkSize = 65536;
+                            const DWORD chunkSize = 4 * 1024 * 1024;
                             DWORD offset = 0;
                             while (offset < dataSize) {
                                 if (WaitForSingleObject(session->hTerminateEvent, 0) == WAIT_OBJECT_0) {
@@ -611,8 +611,6 @@ static DWORD WINAPI FluxIddWorkerThread(LPVOID param) {
                                 }
                                 offset += chunkWritten;
                             }
-
-                            FlushFileBuffers(session->hTransportFile);
 
                             if (offset == dataSize) {
                                 InterlockedIncrement(&session->transportFrameCount);

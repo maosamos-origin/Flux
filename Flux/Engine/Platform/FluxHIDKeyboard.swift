@@ -139,6 +139,7 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         case 0x79: return 0x4E // Page Down
         case 0x73: return 0x4A // Home
         case 0x77: return 0x4D // End
+        case 0x75: return 0x4C // Forward Delete
 
         default: return nil
         }
@@ -331,6 +332,70 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         return report
     }
 
+    /// Opens Windows' native power menu and chooses Shut down (Win+X, U, U).
+    /// Unlike the old Run-dialog route, this never types or executes a shell
+    /// command, does not invoke PowerShell/UAC, and is independent of any
+    /// foreground application. The VM lifecycle still has to observe guest
+    private func sendHIDAction(_ action: () -> Void) -> Bool {
+        action()
+        return waitUntilQueueDrained(timeout: 3.0, pollInterval: 0.01)
+    }
+
+    private func tapHIDKey(_ keyCode: UInt16) -> Bool {
+        guard sendHIDAction({ self.handleKeyDown(keyCode: keyCode, isRepeat: false) }) else {
+            return false
+        }
+        // USB reports may be delivered faster than Windows' keyboard
+        // dispatcher posts the corresponding key-down. Retain each key
+        // briefly so the shell sees a real press/release pair.
+        Thread.sleep(forTimeInterval: 0.08)
+        return sendHIDAction({ self.handleKeyUp(keyCode: keyCode) })
+    }
+
+    /// power-off before this request is considered complete.
+    func requestWindowsShutdownShortcut() -> Bool {
+        requestWindowsPowerMenuShortcut(actionKeyCode: 0x20, label: "Win+X,U,U")
+    }
+
+    /// Sends native Windows restart shortcut (Win+X, U, R).
+    func requestWindowsRestartShortcut() -> Bool {
+        requestWindowsPowerMenuShortcut(actionKeyCode: 0x0F, label: "Win+X,U,R")
+    }
+
+    private func requestWindowsPowerMenuShortcut(actionKeyCode: UInt16, label: String) -> Bool {
+        resetState()
+        guard waitUntilQueueDrained(timeout: 3.0, pollInterval: 0.01),
+              sendHIDAction({ self.handleFlagsChanged(keyCode: 55, rawFlags: 0x0008 | 0x100000) }),
+              tapHIDKey(0x07), // X
+              sendHIDAction({ self.handleFlagsChanged(keyCode: 55, rawFlags: 0) }) else {
+            return false
+        }
+
+        // Windows creates the native quick-link menu asynchronously. This is
+        // not used as delivery proof: every HID transfer is acknowledged above
+        // and only guest power-off completes the request.
+        Thread.sleep(forTimeInterval: 0.5)
+        guard tapHIDKey(0x20) else { return false } // U
+        Thread.sleep(forTimeInterval: 0.25)
+        guard tapHIDKey(actionKeyCode) else { return false }
+
+        print("[HID-POWER] Submitted native Windows power shortcut \(label)")
+        return true
+    }
+
+    /// Sends Ctrl+Alt+Del (Left Control + Left Option + Forward Delete) to Windows.
+    func sendCtrlAltDelShortcut() -> Bool {
+        resetState()
+        guard waitUntilQueueDrained(timeout: 3.0, pollInterval: 0.01),
+              sendHIDAction({ self.handleFlagsChanged(keyCode: 59, rawFlags: 0x0001 | 0x0020) }),
+              tapHIDKey(0x75), // Forward Delete (HID 0x4C)
+              sendHIDAction({ self.handleFlagsChanged(keyCode: 59, rawFlags: 0) }) else {
+            return false
+        }
+        print("[HID-CAD] Submitted Ctrl+Alt+Del")
+        return true
+    }
+
     // MARK: - Automated Live Test Runner
 
     private var testStarted = false
@@ -348,18 +413,22 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         let pnpRestartTest = ProcessInfo.processInfo.environment["FLUX_TEST_PNP_RESTART"] == "1"
         let swdMigrationTest = ProcessInfo.processInfo.environment["FLUX_TEST_SWD_MIGRATION"] == "1"
         let milestone3Test = ProcessInfo.processInfo.environment["FLUX_TEST_MILESTONE3"] == "1"
+        let shutdownTest = ProcessInfo.processInfo.environment["FLUX_TEST_SHUTDOWN"] == "1"
 #else
         let finishInstallTest = false
         let rebootVerifyTest = false
         let pnpRestartTest = false
         let swdMigrationTest = false
         let milestone3Test = false
+        let shutdownTest = false
 #endif
+
         let competingModes = [
             tpCertutilTest ? "FLUX_TEST_TP_CERTUTIL" : nil,
-            signingPolicyAuditTest ? "FLUX_TEST_SIGNING_AUDIT" : nil
+            signingPolicyAuditTest ? "FLUX_TEST_SIGNING_AUDIT" : nil,
+            shutdownTest ? "FLUX_TEST_SHUTDOWN" : nil
         ].compactMap { $0 }.joined(separator: ",")
-        guard tpCertutilTest || signingPolicyAuditTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test else {
+        guard tpCertutilTest || signingPolicyAuditTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test || shutdownTest else {
             if let val = launcherFlagValue {
                 Self.appendKeyboardTrace("[SIGNING-LAUNCHER-SCHED] timestamp=\(launchTimestamp) flagValue=\(val) schedulerEntered=NO timerArmed=NO skipReason=FLAG_VALUE_NOT_1")
             }
@@ -432,14 +501,18 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         let pnpRestartTest = ProcessInfo.processInfo.environment["FLUX_TEST_PNP_RESTART"] == "1"
         let swdMigrationTest = ProcessInfo.processInfo.environment["FLUX_TEST_SWD_MIGRATION"] == "1"
         let milestone3Test = ProcessInfo.processInfo.environment["FLUX_TEST_MILESTONE3"] == "1"
+        let shutdownTest = ProcessInfo.processInfo.environment["FLUX_TEST_SHUTDOWN"] == "1"
+        let installSilentHelperTest = ProcessInfo.processInfo.environment["FLUX_TEST_INSTALL_SILENT_HELPER"] == "1"
 #else
         let finishInstallTest = false
         let rebootVerifyTest = false
         let pnpRestartTest = false
         let swdMigrationTest = false
         let milestone3Test = false
+        let shutdownTest = false
+        let installSilentHelperTest = false
 #endif
-        guard liveKeyboardTest || winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test else { return }
+        guard liveKeyboardTest || winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test || shutdownTest || installSilentHelperTest else { return }
         lock.lock()
         if testStarted {
             lock.unlock()
@@ -451,10 +524,14 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         testStarted = true
         lock.unlock()
 
-        let delay: TimeInterval = (winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test) ? 60.0 : 2.5
+        let delay: TimeInterval = (winRAutomationTest || uacTraceTest || tpCertutilTest || signingPolicyAuditTest || signingPolicyAuditStageTest || signingPolicyLauncherTest || devNodeCreateTest || finishInstallTest || rebootVerifyTest || pnpRestartTest || swdMigrationTest || milestone3Test || shutdownTest || installSilentHelperTest) ? 60.0 : 2.5
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            if milestone3Test {
+            if installSilentHelperTest {
+                self.runInstallSilentHelperTest()
+            } else if shutdownTest {
+                self.runShutdownTest()
+            } else if milestone3Test {
                 self.runMilestone3Test()
             } else if swdMigrationTest {
                 self.runSwdMigrationTest()
@@ -587,6 +664,54 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
         handleKeyDown(keyCode: 0x24, isRepeat: false) // Enter
         Thread.sleep(forTimeInterval: 0.15)
         handleKeyUp(keyCode: 0x24)
+    }
+
+    /// Submits a Win+R command with endpoint acknowledgements after every HID
+    /// transition. Unlike the historical delay-only route, this refuses to
+    /// report delivery if EP3 has not consumed every press and release.
+    /// It deliberately does not claim Windows has shut down; VM resource
+    /// release is the only accepted shutdown confirmation.
+    func sendWinRVerified(command: String) -> Bool {
+        func send(_ action: () -> Void) -> Bool {
+            action()
+            return waitUntilQueueDrained(timeout: 3.0, pollInterval: 0.01)
+        }
+
+        guard send({ self.handleFlagsChanged(keyCode: 55, rawFlags: 0x0008 | 0x100000) }),
+              send({ self.handleKeyDown(keyCode: 0x0F, isRepeat: false) }),
+              send({ self.handleKeyUp(keyCode: 0x0F) }),
+              send({ self.handleFlagsChanged(keyCode: 55, rawFlags: 0) }) else {
+            return false
+        }
+
+        // The Run dialog itself has no host-visible readiness notification.
+        // This bounded wait is only for Windows to create it; individual HID
+        // reports below are acknowledged by EP3 rather than timed blindly.
+        Thread.sleep(forTimeInterval: 1.0)
+
+        for _ in 0..<60 {
+            guard send({ self.handleKeyDown(keyCode: 0x33, isRepeat: false) }),
+                  send({ self.handleKeyUp(keyCode: 0x33) }) else { return false }
+        }
+
+        let charMap: [Character: UInt16] = [
+            "a": 0x00, "d": 0x02, "h": 0x04, "n": 0x2E, "o": 0x1F,
+            "s": 0x01, "t": 0x11, "u": 0x20, "w": 0x0D, "0": 0x1D,
+            "/": 0x2C, " ": 0x31
+        ]
+        for character in command {
+            guard let keyCode = charMap[character] else {
+                print("[HID-SHUTDOWN] Unsupported command character: \(character)")
+                return false
+            }
+            guard send({ self.handleKeyDown(keyCode: keyCode, isRepeat: false) }),
+                  send({ self.handleKeyUp(keyCode: keyCode) }) else { return false }
+        }
+
+        guard send({ self.handleKeyDown(keyCode: 0x24, isRepeat: false) }),
+              send({ self.handleKeyUp(keyCode: 0x24) }) else { return false }
+        print("[HID-SHUTDOWN] HID_DELIVERY_CONFIRMED command=shutdown /s /t 0")
+        return true
     }
 
     /// Test-only, command-free control for validating the synthetic Win+R
@@ -927,6 +1052,73 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
     }
 
 #if DEBUG
+    /// Controlled installation of verified silent GUI FluxDevNode.exe (Run #57) to C:\FluxTools\FluxDevNode.exe
+    private func runInstallSilentHelperTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let launcherCommand = "cmd /c for %d in (D E F G H I J K) do if exist %d:\\FluxInstallSilentHelper.cmd start \"\" %d:\\FluxInstallSilentHelper.cmd"
+        print("[INSTALL-SILENT-HELPER] Launching elevated installer via Win+R: \(launcherCommand)")
+        sendWinR(command: launcherCommand, charDelay: 0.04)
+        appendAutoKeyTrace(action: "INSTALL_SILENT_HELPER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[INSTALL-SILENT-HELPER] Submitted installer command via Win+R")
+
+        let appDir = FluxVM.defaultAppDirectory()
+        // Wait 6 seconds for Win+R and PowerShell to start and trigger UAC prompt
+        Thread.sleep(forTimeInterval: 6.0)
+        FluxVM.captureCurrentScreenshot(path: appDir + "/silent-helper-uac.bmp")
+
+        // Dispatched approval attempts: Alt+Y and pointer click at Yes button center
+        for attempt in 1...6 {
+            print("[INSTALL-SILENT-HELPER] UAC consent approval attempt \(attempt)...")
+            // Pointer click at Yes button center (x=11632, y=24520 in HID coordinates)
+            FluxHIDPointer.shared.updatePosition(x: 11632, y: 24520)
+            Thread.sleep(forTimeInterval: 0.15)
+            FluxHIDPointer.shared.updateButtons(0x01)
+            Thread.sleep(forTimeInterval: 0.1)
+            FluxHIDPointer.shared.updateButtons(0x00)
+            Thread.sleep(forTimeInterval: 0.2)
+
+            // Alt+Y accelerator (standard Windows UAC shortcut for Yes)
+            handleFlagsChanged(keyCode: 58, rawFlags: 0x0020 | 0x80000) // Left Alt down
+            Thread.sleep(forTimeInterval: 0.15)
+            handleKeyDown(keyCode: 0x10, isRepeat: false) // Y down
+            Thread.sleep(forTimeInterval: 0.15)
+            handleKeyUp(keyCode: 0x10) // Y up
+            Thread.sleep(forTimeInterval: 0.15)
+            handleFlagsChanged(keyCode: 58, rawFlags: 0) // Left Alt up
+            Thread.sleep(forTimeInterval: 1.5)
+        }
+
+        FluxVM.captureCurrentScreenshot(path: appDir + "/silent-helper-uac-after.bmp")
+        print("[INSTALL-SILENT-HELPER] UAC approval sequence complete. Awaiting guest installer completion and power-off...")
+
+        // Await guest installer execution and graceful power-off (up to 90 seconds).
+        // The guest installer itself verifies the SHA-256 hash, writes the evidence file,
+        // and issues Stop-Computer -Force only upon verified success.
+        for second in 1...90 {
+            Thread.sleep(forTimeInterval: 1.0)
+            if second % 15 == 0 {
+                FluxVM.captureCurrentScreenshot(path: appDir + "/silent-helper-progress-\(second)s.bmp")
+                print("[INSTALL-SILENT-HELPER] Waiting for guest installer completion (\(second)s / 90s)...")
+            }
+        }
+    }
+
+    /// Automated shutdown test route.
+    private func runShutdownTest() {
+        resetState()
+        FluxHIDPointer.shared.updateButtons(0)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let shutdownCommand = "powershell.exe -NoProfile -Command \"Stop-Computer -Force\""
+        print("[SHUTDOWN-TEST] Issuing Stop-Computer -Force via Win+R")
+        sendWinR(command: shutdownCommand)
+        appendAutoKeyTrace(action: "SHUTDOWN_TRIGGER_ZERO_REPORT", keyCode: 0, usage: nil, report: currentReportSnapshot())
+        print("[SHUTDOWN-TEST] Stop-Computer command submitted; awaiting guest power-off...")
+    }
+
     /// Temporary fixed-command installer route.
     private func runFinishInstallTest() {
         resetState()
@@ -1094,31 +1286,45 @@ nonisolated final class FluxHIDKeyboard: @unchecked Sendable {
 
         print("[MILESTONE3] UAC approvals dispatched. Waiting for driver update & multi-mode tests...")
 
-        // Step 2 update takes ~28s (cert import + stop + pnputil del/add + devcon + start daemon + settle):
-        Thread.sleep(forTimeInterval: 30.0)
+        // Step 2 update takes ~25s (cert import + helper update + pnputil add/restart + settle):
+        Thread.sleep(forTimeInterval: 32.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-update-done.bmp")
 
-        // Step 4 Mode 1: 800x600 (4s settle)
-        Thread.sleep(forTimeInterval: 6.0)
+        // Step 4 Mode 1: 800x600 (4s settle + query)
+        Thread.sleep(forTimeInterval: 7.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-800x600.bmp")
 
-        // Step 4 Mode 2: 1280x720 (4s settle)
-        Thread.sleep(forTimeInterval: 6.0)
+        // Step 4 Mode 2: 1280x720 (4s settle + query)
+        Thread.sleep(forTimeInterval: 7.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-1280x720.bmp")
 
-        // Step 4 Mode 3: 1600x900 (4s settle)
-        Thread.sleep(forTimeInterval: 6.0)
+        // Step 4 Mode 3: 1600x900 (4s settle + query)
+        Thread.sleep(forTimeInterval: 7.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-1600x900.bmp")
 
-        // Step 4 Mode 4: 1920x1080 (4s settle)
-        Thread.sleep(forTimeInterval: 6.0)
+        // Step 4 Mode 4: 1920x1080 (4s settle + query)
+        Thread.sleep(forTimeInterval: 7.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-mode-1920x1080.bmp")
 
         // Step 5 Resagent startup & evidence copy
-        Thread.sleep(forTimeInterval: 10.0)
+        Thread.sleep(forTimeInterval: 12.0)
         FluxVM.captureCurrentScreenshot(path: appDir + "/milestone3-complete.bmp")
         print("[MILESTONE3] Milestone 3 automated test sequence complete")
     }
+#endif
+
+#if !DEBUG
+    // Release hard-disables the corresponding FLUX_TEST_* flags above. Swift
+    // nevertheless type-checks every branch of the launch scheduler, so keep
+    // private no-op symbols for its DEBUG-only test hooks. They cannot issue
+    // guest input, scripts, UAC actions, or shutdown requests in Release.
+    private func runInstallSilentHelperTest() {}
+    private func runShutdownTest() {}
+    private func runFinishInstallTest() {}
+    private func runRebootVerifyTest() {}
+    private func runPnpRestartTest() {}
+    private func runSwdMigrationTest() {}
+    private func runMilestone3Test() {}
 #endif
 
     /// Test-only Win+R submission that preserves the normal command text,

@@ -6,14 +6,17 @@ import CryptoKit
 /// Thread-safe USB HID Absolute Pointer state tracker and report queue.
 /// Services USB Endpoint 0x82 / xHCI DCI 5 on Slot 1.
 ///
-/// Report format (6 bytes):
+/// Report format (7 bytes):
 /// - Byte 0: Buttons (Bit 0: Left, Bit 1: Right, Bit 2: Middle)
 /// - Bytes 1..2: Absolute X (UInt16 Little-Endian, 0...32767)
 /// - Bytes 3..4: Absolute Y (UInt16 Little-Endian, 0...32767)
 /// - Byte 5: Vertical Wheel (Int8 Little-Endian, -127...+127)
+/// - Byte 6: Consumer AC Pan / horizontal wheel (Int8 Little-Endian, -127...+127)
 nonisolated final class FluxHIDPointer {
     static let shared = FluxHIDPointer()
+    static let reportLength = FluxPointerInputProtocol.reportLength
     private static let uacPointerTraceLock = NSLock()
+    private static let inputDiagnosticsEnabled = ProcessInfo.processInfo.environment["FLUX_INPUT_DIAGNOSTICS"] == "1"
 
     private let lock = NSLock()
     private var buttons: UInt8 = 0
@@ -22,6 +25,15 @@ nonisolated final class FluxHIDPointer {
     private var reportQueue: [[UInt8]] = []
 
     private init() {}
+
+    /// Bounded host-only input telemetry. It is intentionally off by default
+    /// and contains event/report metadata only, never keyboard text.
+    static func appendInputDiagnostic(stage: String, detail: String) {
+        guard inputDiagnosticsEnabled else { return }
+        let fallback = URL(fileURLWithPath: FluxVM.defaultAppDirectory(), isDirectory: true)
+        let directory = FluxInputDiagnostics.runtimeDirectory(fallback: fallback)
+        FluxInputDiagnostics.enqueue(stage: stage, detail: detail, directory: directory)
+    }
 
     /// Test-only durable trace for correlating delivered EP5 pointer reports
     /// with a UAC secure-desktop transition. It is gated so normal pointer
@@ -59,7 +71,7 @@ nonisolated final class FluxHIDPointer {
         lock.lock()
         currentX = x
         currentY = y
-        reportBytes = enqueueReportLocked(coalesceMotion: true, wheel: 0)
+        reportBytes = enqueueReportLocked(coalesceMotion: true, verticalWheel: 0, horizontalPan: 0)
         lock.unlock()
 
         FluxXHCI.notifyPointerEvent()
@@ -73,7 +85,7 @@ nonisolated final class FluxHIDPointer {
         lock.lock()
         if (newButtons & 0x07) != buttons {
             buttons = newButtons & 0x07
-            reportBytes = enqueueReportLocked(coalesceMotion: false, wheel: 0)
+            reportBytes = enqueueReportLocked(coalesceMotion: false, verticalWheel: 0, horizontalPan: 0)
             changed = true
         }
         lock.unlock()
@@ -92,21 +104,32 @@ nonisolated final class FluxHIDPointer {
         buttons = newButtons & 0x07
         currentX = x
         currentY = y
-        reportBytes = enqueueReportLocked(coalesceMotion: !buttonChanged, wheel: 0)
+        reportBytes = enqueueReportLocked(coalesceMotion: !buttonChanged, verticalWheel: 0, horizontalPan: 0)
         lock.unlock()
+
+        if buttonChanged {
+            Self.appendInputDiagnostic(stage: "HID_POINTER", detail: "ownedMask=0x\(String(newButtons & 0x07, radix: 16)) report=\(reportBytes.map { String(format: "%02x", $0) }.joined(separator: ""))")
+        }
 
         FluxXHCI.notifyPointerEvent()
     }
 
-    /// Enqueues a relative vertical scroll wheel event.
+    /// Enqueues a relative vertical scroll wheel event. Kept for existing
+    /// callers; trackpad input uses `updateScroll` to include AC Pan.
     func updateWheel(delta: Int8) {
-        guard delta != 0 else { return }
+        updateScroll(vertical: delta, horizontal: 0)
+    }
+
+    /// Enqueues one atomic two-axis scroll report. A single AppKit scroll event
+    /// therefore cannot become duplicate vertical and horizontal HID events.
+    func updateScroll(vertical: Int8, horizontal: Int8) {
+        guard vertical != 0 || horizontal != 0 else { return }
         var reportBytes: [UInt8] = []
         lock.lock()
-        reportBytes = enqueueReportLocked(coalesceMotion: false, wheel: delta)
+        reportBytes = enqueueReportLocked(coalesceMotion: false, verticalWheel: vertical, horizontalPan: horizontal)
         lock.unlock()
 
-        print("🖱️ [HID-POINTER] wheel delta=\(delta) report=[\(reportBytes.map { String(format: "%02x", $0) }.joined(separator: " "))]")
+        print("🖱️ [HID-POINTER] scroll vertical=\(vertical) horizontal=\(horizontal) report=[\(reportBytes.map { String(format: "%02x", $0) }.joined(separator: " "))]")
         FluxXHCI.notifyPointerEvent()
     }
 
@@ -116,13 +139,14 @@ nonisolated final class FluxHIDPointer {
         var changed = false
         lock.lock()
         if buttons != 0 {
-            buttons = 0
-            reportBytes = enqueueReportLocked(coalesceMotion: false, wheel: 0)
+            buttons = FluxPointerInputProtocol.releasedButtons
+            reportBytes = enqueueReportLocked(coalesceMotion: false, verticalWheel: 0, horizontalPan: 0)
             changed = true
         }
         lock.unlock()
 
         if changed {
+            Self.appendInputDiagnostic(stage: "HID_POINTER", detail: "ownedMask=0x\(String(buttons, radix: 16)) report=\(reportBytes.map { String(format: "%02x", $0) }.joined(separator: ""))")
             print("🖱️ [HID-POINTER] resetButtons: released all buttons report=[\(reportBytes.map { String(format: "%02x", $0) }.joined(separator: " "))]")
             FluxXHCI.notifyPointerEvent()
         }
@@ -130,23 +154,18 @@ nonisolated final class FluxHIDPointer {
 
     // MARK: - Queue Management
 
-    private func makeReportBytes(b: UInt8, x: UInt16, y: UInt16, wheel: Int8) -> [UInt8] {
-        [
-            b & 0x07,
-            UInt8(truncatingIfNeeded: x),
-            UInt8(truncatingIfNeeded: x >> 8),
-            UInt8(truncatingIfNeeded: y),
-            UInt8(truncatingIfNeeded: y >> 8),
-            UInt8(bitPattern: wheel)
-        ]
-    }
-
-    private func enqueueReportLocked(coalesceMotion: Bool, wheel: Int8) -> [UInt8] {
-        let rep = makeReportBytes(b: buttons, x: currentX, y: currentY, wheel: wheel)
-        // Only coalesce pure motion events (no wheel delta, same buttons)
-        if coalesceMotion, wheel == 0, !reportQueue.isEmpty {
+    private func enqueueReportLocked(coalesceMotion: Bool, verticalWheel: Int8, horizontalPan: Int8) -> [UInt8] {
+        let rep = FluxPointerInputProtocol.makeReport(
+            buttons: buttons, x: currentX, y: currentY,
+            verticalWheel: verticalWheel, horizontalPan: horizontalPan
+        )
+        // Only coalesce pure motion events (no wheel or pan delta, same buttons).
+        if coalesceMotion, verticalWheel == 0, horizontalPan == 0, !reportQueue.isEmpty {
             let lastIndex = reportQueue.count - 1
-            if reportQueue[lastIndex][0] == (buttons & 0x07), reportQueue[lastIndex][5] == 0 {
+            if reportQueue[lastIndex].count == Self.reportLength,
+               reportQueue[lastIndex][0] == (buttons & 0x07),
+               reportQueue[lastIndex][5] == 0,
+               reportQueue[lastIndex][6] == 0 {
                 // Same buttons and no pending wheel delta: coalesce motion in-place
                 reportQueue[lastIndex] = rep
                 return rep
@@ -155,7 +174,9 @@ nonisolated final class FluxHIDPointer {
         // Cap maximum queue length to prevent unbounded growth if guest stops servicing
         if reportQueue.count >= 32 {
             if let dropIdx = reportQueue.indices.first(where: { idx in
-                idx > 0 && reportQueue[idx][0] == reportQueue[idx - 1][0] && reportQueue[idx][5] == 0
+                idx > 0 && reportQueue[idx].count == Self.reportLength && reportQueue[idx - 1].count == Self.reportLength &&
+                    reportQueue[idx][0] == reportQueue[idx - 1][0] &&
+                    reportQueue[idx][5] == 0 && reportQueue[idx][6] == 0
             }) {
                 reportQueue.remove(at: dropIdx)
             }
@@ -191,52 +212,8 @@ nonisolated final class FluxHIDPointer {
     ///
     /// Correctly accounts for letterboxing, pillarboxing, aspect-ratio scaling,
     /// and guest framebuffer dimensions.
-    static func mapPointToHID(
-        viewPoint: CGPoint,
-        viewSize: CGSize,
-        fbWidth: Int,
-        fbHeight: Int
-    ) -> (hidX: UInt16, hidY: UInt16, guestX: Int, guestY: Int)? {
-        guard fbWidth > 0, fbHeight > 0, viewSize.width > 0, viewSize.height > 0 else {
-            return nil
-        }
-
-        let fbAspect = CGFloat(fbWidth) / CGFloat(fbHeight)
-        let viewAspect = viewSize.width / viewSize.height
-
-        let renderWidth: CGFloat
-        let renderHeight: CGFloat
-        let offsetX: CGFloat
-        let offsetY: CGFloat
-
-        if viewAspect > fbAspect {
-            // View is wider than guest framebuffer: pillarboxed (black bars left and right)
-            renderHeight = viewSize.height
-            renderWidth = viewSize.height * fbAspect
-            offsetX = (viewSize.width - renderWidth) / 2.0
-            offsetY = 0
-        } else {
-            // View is taller than guest framebuffer: letterboxed (black bars top and bottom)
-            renderWidth = viewSize.width
-            renderHeight = viewSize.width / fbAspect
-            offsetX = 0
-            offsetY = (viewSize.height - renderHeight) / 2.0
-        }
-
-        // Clamp view point to the active guest image rectangle
-        let clampedX = min(max(viewPoint.x - offsetX, 0), renderWidth)
-        let clampedY = min(max(viewPoint.y - offsetY, 0), renderHeight)
-
-        let normalizedX = renderWidth > 0 ? (clampedX / renderWidth) : 0
-        let normalizedY = renderHeight > 0 ? (clampedY / renderHeight) : 0
-
-        let hidX = UInt16(clamping: Int(round(normalizedX * 32767.0)))
-        let hidY = UInt16(clamping: Int(round(normalizedY * 32767.0)))
-
-        let guestX = Int(round(normalizedX * CGFloat(fbWidth - 1)))
-        let guestY = Int(round(normalizedY * CGFloat(fbHeight - 1)))
-
-        return (hidX, hidY, guestX, guestY)
+    static func mapPointToHID(viewPoint: CGPoint, viewSize: CGSize, fbWidth: Int, fbHeight: Int, fillScreen: Bool = false) -> (hidX: UInt16, hidY: UInt16, guestX: Int, guestY: Int)? {
+        FluxPointerInputProtocol.mapPointToHID(viewPoint: viewPoint, viewSize: viewSize, fbWidth: fbWidth, fbHeight: fbHeight, fillScreen: fillScreen)
     }
 
     // MARK: - Automated Live Test Runner

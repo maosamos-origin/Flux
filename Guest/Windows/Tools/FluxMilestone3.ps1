@@ -225,7 +225,12 @@ if ($mediaDrive) {
     # Update helper binary if media has a copy
     if (Test-Path $newHelper) {
         try {
+            Stop-ScheduledTask -TaskName "FluxDevNode" -ErrorAction SilentlyContinue
+            & $destHelper stop | Out-Null
+            Start-Sleep -Seconds 2
             Copy-Item -LiteralPath $newHelper -Destination $destHelper -Force
+            Start-ScheduledTask -TaskName "FluxDevNode"
+            Start-Sleep -Seconds 3
             Log "UPDATED_C_FLUXTOOLS_HELPER=YES"
             Log ("NEW_HELPER_SHA256=" + (Get-FileHash -LiteralPath $destHelper -Algorithm SHA256).Hash)
         } catch {
@@ -233,21 +238,22 @@ if ($mediaDrive) {
         }
     }
 
-    # Ensure device is active
-    if ($preSwd.Count -eq 0 -or $preSwd[0].Status -ne 'OK') {
-        Log "REINSTALLING_DRIVER_PACKAGE..."
+    # Install/update driver package from media
+    if (Test-Path $pkgInf) {
+        Log ("UPDATING_DRIVER_PACKAGE=" + $pkgInf)
         try {
-            Stop-ScheduledTask -TaskName "FluxDevNode" -ErrorAction SilentlyContinue
-            Stop-Process -Name WUDFHost -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            & pnputil.exe /add-driver $pkgInf /install | Out-Null
-            Start-ScheduledTask -TaskName "FluxDevNode"
+            $pnpAdd = & pnputil.exe /add-driver $pkgInf /install 2>&1
+            foreach ($l in $pnpAdd) { Log ("PNPUTIL_ADD: " + $l) }
+
+            # Restart SWD\FluxIdd\0 so WUDFHost reloads the newly installed driver DLL
+            Log "RESTARTING_DEVICE_PNPUTIL: SWD\FluxIdd\0"
+            $pnpRestart = & pnputil.exe /restart-device "SWD\FluxIdd\0" 2>&1
+            foreach ($r in $pnpRestart) { Log ("PNPUTIL_RESTART: " + $r) }
+            Log "SETTLE_AFTER_RESTART=10s"
             Start-Sleep -Seconds 10
         } catch {
-            Log ("REINSTALL_ERR=" + $_.Exception.Message)
+            Log ("DRIVER_UPDATE_ERR=" + $_.Exception.Message)
         }
-    } else {
-        Log "DRIVER_ALREADY_INSTALLED_AND_OK=YES"
     }
 }
 Log "--- END STEP 2: DRIVER PACKAGE VERIFICATION ---"
@@ -267,6 +273,13 @@ if ($postSwd.Count -ge 1) {
     Log ("POST_DEVICE_STATUS=" + $postSwd[0].Status)
     Log ("POST_PROBLEM_CODE=" + $postSwd[0].ConfigManagerErrorCode)
     Log ("POST_SERVICE=" + $postSwd[0].Service)
+}
+
+$drv = @(Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceID -eq 'SWD\FluxIdd\0' })
+if ($drv.Count -ge 1) {
+    Log ("POST_DRIVER_PROVIDER=" + $drv[0].DriverProviderName)
+    Log ("POST_DRIVER_VERSION=" + $drv[0].DriverVersion)
+    Log ("POST_DRIVER_INF=" + $drv[0].InfName)
 }
 
 $postDaemon = @(Get-Process -Name FluxDevNode -ErrorAction SilentlyContinue)
@@ -295,10 +308,12 @@ $modes = @(
     @{ Width = 1920; Height = 1080; Name = "FULL_HD_1920x1080" }
 )
 
-$helperExe = "C:\FluxTools\FluxDevNode.exe"
-if (-not (Test-Path $helperExe)) {
-    $helperExe = Join-Path $mediaDrive "FluxTools\FluxDevNode.exe"
+$helperExe = if ($mediaDrive -and (Test-Path (Join-Path $mediaDrive "FluxTools\FluxDevNode.exe"))) {
+    Join-Path $mediaDrive "FluxTools\FluxDevNode.exe"
+} else {
+    "C:\FluxTools\FluxDevNode.exe"
 }
+Log ("USING_HELPER_EXE=" + $helperExe)
 
 foreach ($m in $modes) {
     Log ""
@@ -311,9 +326,9 @@ foreach ($m in $modes) {
         Log ("SETRES_OUT: " + $line)
     }
 
-    # 2. If helper returned error (or didn't change mode), invoke SetResolution directly via DisplayHelper
-    $helperFailed = ($setResOut | Where-Object { $_ -like '*RESULT=FAIL*' -or $_ -like '*ERROR_CODE*' })
-    if ($helperFailed) {
+    # 2. If helper returned error (or didn't succeed), invoke SetResolution directly via DisplayHelper
+    $helperSuccess = ($setResOut | Where-Object { $_ -like '*DISP_CHANGE_SUCCESSFUL*' })
+    if (-not $helperSuccess) {
         Log "INVOKING_DISPLAYHELPER_DIRECT: SetResolution(" + $postTargetDevice + ", " + $m.Width + ", " + $m.Height + ")"
         $dhRes = [DisplayHelper]::SetResolution($postTargetDevice, $m.Width, $m.Height)
         Log ("DISPLAYHELPER_DIRECT_RESULT=" + $dhRes)

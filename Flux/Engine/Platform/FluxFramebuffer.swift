@@ -16,6 +16,10 @@ public final class FluxFramebuffer: ObservableObject, @unchecked Sendable {
     public private(set) var fourcc: UInt32 = 0
     public private(set) var guestAddress: UInt64 = 0
     public private(set) var hostPointer: UnsafeMutableRawPointer? = nil
+    /// Number of bytes that can safely be read from `hostPointer`.  This is
+    /// captured from the guest-RAM mapping when firmware configures RAMFB so
+    /// diagnostic readers can validate their complete read before touching it.
+    public private(set) var mappedByteCapacity: Int = 0
     public private(set) var version: UInt64 = 0
 
     private init() {}
@@ -28,7 +32,8 @@ public final class FluxFramebuffer: ObservableObject, @unchecked Sendable {
         width: UInt32,
         height: UInt32,
         stride: UInt32,
-        hostPointer: UnsafeMutableRawPointer
+        hostPointer: UnsafeMutableRawPointer,
+        mappedByteCapacity: Int
     ) {
         lock.lock()
         self.guestAddress = guestAddress
@@ -37,6 +42,7 @@ public final class FluxFramebuffer: ObservableObject, @unchecked Sendable {
         self.height = Int(height)
         self.stride = Int(stride)
         self.hostPointer = hostPointer
+        self.mappedByteCapacity = max(0, mappedByteCapacity)
         self.isConfigured = true
         self.version &+= 1
         lock.unlock()
@@ -59,6 +65,7 @@ public final class FluxFramebuffer: ObservableObject, @unchecked Sendable {
         height = 0
         stride = 0
         hostPointer = nil
+        mappedByteCapacity = 0
         isConfigured = false
         version &+= 1
         lock.unlock()
@@ -69,9 +76,9 @@ public final class FluxFramebuffer: ObservableObject, @unchecked Sendable {
     }
 
     /// Safely copies the current configuration for the Metal rendering thread.
-    public func snapshot() -> (isConfigured: Bool, width: Int, height: Int, stride: Int, hostPointer: UnsafeMutableRawPointer?, version: UInt64) {
+    public func snapshot() -> (isConfigured: Bool, width: Int, height: Int, stride: Int, fourcc: UInt32, guestAddress: UInt64, hostPointer: UnsafeMutableRawPointer?, mappedByteCapacity: Int, version: UInt64) {
         lock.lock()
         defer { lock.unlock() }
-        return (isConfigured, width, height, stride, hostPointer, version)
+        return (isConfigured, width, height, stride, fourcc, guestAddress, hostPointer, mappedByteCapacity, version)
     }
 }

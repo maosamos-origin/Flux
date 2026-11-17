@@ -164,6 +164,16 @@ public final class FluxFrameTransport: @unchecked Sendable {
     private var sessionActive: Bool = false
     private var sessionLastSequence: UInt32 = 0
 
+    // Offset-ordered reassembly extents for out-of-order Windows NVMe writes (sourceOffset > 0)
+    private struct NVMeExtent {
+        var start: UInt64
+        var data: Data
+        var end: UInt64 { start &+ UInt64(data.count) }
+    }
+    private var nvmeExtents: [NVMeExtent] = []
+    private static let maxBufferedExtentBytes = 32 * 1024 * 1024
+    private var lastReportWriteUptime: TimeInterval = 0
+
     public private(set) var lastSequence: UInt32 = 0
     public private(set) var lastWidth: UInt32 = 0
     public private(set) var lastHeight: UInt32 = 0
@@ -187,18 +197,45 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
     private init() {}
 
+    private static let crc32cTable: [UInt32] = (0..<256).map { index in
+        var crc = UInt32(index)
+        for _ in 0..<8 {
+            crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0x82F6_3B78 : 0)
+        }
+        return crc
+    }
+
     /// CRC-32C/ISCSI over the exact transmitted byte sequence: reflected
     /// Castagnoli polynomial 0x82F63B78, init/final XOR 0xFFFFFFFF.
     /// `123456789` must evaluate to 0xE3069283 on both Windows and macOS.
     public static func crc32c(_ bytes: [UInt8]) -> UInt32 {
         var crc: UInt32 = 0xFFFF_FFFF
-        for byte in bytes {
-            crc ^= UInt32(byte)
-            for _ in 0..<8 {
-                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0x82F6_3B78 : 0)
+        crc32cTable.withUnsafeBufferPointer { table in
+            bytes.withUnsafeBufferPointer { buf in
+                for i in 0..<buf.count {
+                    let idx = Int((crc ^ UInt32(buf[i])) & 0xFF)
+                    crc = (crc >> 8) ^ table[idx]
+                }
             }
         }
         return crc ^ 0xFFFF_FFFF
+    }
+
+    /// Computes both the 32-bit additive checksum and CRC-32C in a single pass.
+    private static func computeIntegrityDigests(_ bytes: [UInt8]) -> (checksum: UInt32, crc32c: UInt32) {
+        var checksum: UInt32 = 0
+        var crc: UInt32 = 0xFFFF_FFFF
+        crc32cTable.withUnsafeBufferPointer { table in
+            bytes.withUnsafeBufferPointer { buf in
+                for i in 0..<buf.count {
+                    let b = buf[i]
+                    checksum &+= UInt32(b)
+                    let idx = Int((crc ^ UInt32(b)) & 0xFF)
+                    crc = (crc >> 8) ^ table[idx]
+                }
+            }
+        }
+        return (checksum, crc ^ 0xFFFF_FFFF)
     }
 
     public static func crc32cTestVectorPasses() -> Bool {
@@ -233,6 +270,19 @@ public final class FluxFrameTransport: @unchecked Sendable {
         guard count > 0 else { return }
         lock.lock()
         defer { lock.unlock() }
+
+        if sourceOffset > 0 {
+            let chunk = Data(bytes: ptr, count: count)
+            insertNVMeExtent(start: sourceOffset, chunk: chunk)
+            if writeOrdinal != 0 {
+                currentAssemblyWriteOrdinals.append(writeOrdinal)
+                if currentAssemblyWriteOrdinals.count > Self.maximumRecordedWrites {
+                    currentAssemblyWriteOrdinals.removeFirst()
+                }
+            }
+            tryAssembleFromExtents()
+            return
+        }
 
         var offset = 0
         let raw = ptr.assumingMemoryBound(to: UInt8.self)
@@ -342,7 +392,7 @@ public final class FluxFrameTransport: @unchecked Sendable {
                 offset += toCopy
 
                 if payloadBuffer.count == expectedPayloadSize {
-                    processCompletedPayload()
+                    _ = processCompletedPayload()
                     state = .idle
                     headerBuffer.removeAll(keepingCapacity: true)
                     currentHeader = nil
@@ -351,19 +401,153 @@ public final class FluxFrameTransport: @unchecked Sendable {
         }
     }
 
-    private func processCompletedPayload() {
-        guard let hdr = currentHeader else { return }
+    /// Inserts an NVMe write at its physical disk offset, merging touching or
+    /// overlapping extents so out-of-order stornvme.sys writes are reordered.
+    private func insertNVMeExtent(start: UInt64, chunk: Data) {
+        let newEnd = start &+ UInt64(chunk.count)
+        var mergedStart = start
+        var mergedData = chunk
+        var insertIndex = nvmeExtents.count
 
-        // 1. Verify 32-bit additive checksum
-        var calculatedChecksum: UInt32 = 0
-        for b in payloadBuffer {
-            calculatedChecksum &+= UInt32(b)
+        var i = 0
+        while i < nvmeExtents.count {
+            let ext = nvmeExtents[i]
+            if ext.end < mergedStart {
+                i += 1
+                continue
+            }
+            if ext.start > newEnd {
+                insertIndex = min(insertIndex, i)
+                break
+            }
+            // Fast path: exact contiguous append without reallocating the whole extent.
+            if ext.end == start {
+                nvmeExtents[i].data.append(chunk)
+                if i + 1 < nvmeExtents.count, nvmeExtents[i + 1].start == nvmeExtents[i].end {
+                    let nextData = nvmeExtents[i + 1].data
+                    nvmeExtents[i].data.append(nextData)
+                    nvmeExtents.remove(at: i + 1)
+                }
+                var totalBytes = nvmeExtents.reduce(0) { $0 + $1.data.count }
+                while totalBytes > Self.maxBufferedExtentBytes, !nvmeExtents.isEmpty {
+                    totalBytes -= nvmeExtents.removeFirst().data.count
+                }
+                return
+            }
+            // Touching or overlapping extent: merge while letting newer bytes win.
+            insertIndex = min(insertIndex, i)
+            let combinedStart = min(ext.start, mergedStart)
+            let combinedEnd = max(ext.end, mergedStart &+ UInt64(mergedData.count))
+            var combined = Data(count: Int(combinedEnd - combinedStart))
+            combined.withUnsafeMutableBytes { dst in
+                guard let base = dst.baseAddress else { return }
+                ext.data.withUnsafeBytes { src in
+                    if let s = src.baseAddress {
+                        memcpy(base.advanced(by: Int(ext.start - combinedStart)), s, ext.data.count)
+                    }
+                }
+                mergedData.withUnsafeBytes { src in
+                    if let s = src.baseAddress {
+                        memcpy(base.advanced(by: Int(mergedStart - combinedStart)), s, mergedData.count)
+                    }
+                }
+            }
+            mergedStart = combinedStart
+            mergedData = combined
+            nvmeExtents.remove(at: i)
         }
+
+        nvmeExtents.insert(NVMeExtent(start: mergedStart, data: mergedData), at: min(insertIndex, nvmeExtents.count))
+
+        var totalBytes = nvmeExtents.reduce(0) { $0 + $1.data.count }
+        while totalBytes > Self.maxBufferedExtentBytes, !nvmeExtents.isEmpty {
+            totalBytes -= nvmeExtents.removeFirst().data.count
+        }
+    }
+
+    /// Scans merged disk extents for the latest valid FLXFTRAN header and
+    /// assembles its payload in exact disk-offset order.
+    private func tryAssembleFromExtents() {
+        var matchedHeader: (extentIndex: Int, byteOffset: Int, header: FluxFrameTransportHeader)?
+
+        for (extIdx, ext) in nvmeExtents.enumerated() {
+            guard ext.data.count >= FluxFrameTransportHeader.headerSize else { continue }
+            let magic = ext.data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self) }
+            guard magic == FluxFrameTransportHeader.magicValue else { continue }
+            let hdrBytes = Array(ext.data.prefix(FluxFrameTransportHeader.headerSize))
+            guard let hdr = FluxFrameTransportHeader(bytes: hdrBytes) else {
+                rejectedHeaderCount &+= 1
+                continue
+            }
+            if hdr.sequence == 1 || !sessionActive || hdr.sequence > sessionLastSequence {
+                matchedHeader = (extIdx, 0, hdr)
+            }
+        }
+
+        guard let match = matchedHeader else { return }
+        let hdr = match.header
+        let payloadNeeded = Int(hdr.dataSize)
+        let payloadStartInExt = match.byteOffset + FluxFrameTransportHeader.headerSize
+
+        var availableBytes = max(0, nvmeExtents[match.extentIndex].data.count - payloadStartInExt)
+        if match.extentIndex + 1 < nvmeExtents.count {
+            for idx in (match.extentIndex + 1)..<nvmeExtents.count {
+                availableBytes += nvmeExtents[idx].data.count
+            }
+        }
+        guard availableBytes >= payloadNeeded else { return }
+
+        payloadBuffer.removeAll(keepingCapacity: true)
+        payloadBuffer.reserveCapacity(payloadNeeded)
+
+        let firstSlice = nvmeExtents[match.extentIndex].data.dropFirst(payloadStartInExt).prefix(payloadNeeded)
+        payloadBuffer.append(contentsOf: firstSlice)
+
+        var idx = match.extentIndex + 1
+        while payloadBuffer.count < payloadNeeded, idx < nvmeExtents.count {
+            let remaining = payloadNeeded - payloadBuffer.count
+            payloadBuffer.append(contentsOf: nvmeExtents[idx].data.prefix(remaining))
+            idx += 1
+        }
+
+        guard payloadBuffer.count == payloadNeeded else { return }
+
+        if hdr.sequence == 1 && (!sessionActive || sessionLastSequence != 0) {
+            sessionActive = true
+            sessionCount += 1
+            sessionFrameCount = 0
+            sessionLastSequence = 0
+            print("📸 [FRAME-TRANSPORT] Session #\(sessionCount) started (seq=1)")
+        } else if !sessionActive {
+            sessionActive = true
+            sessionCount += 1
+            sessionFrameCount = 0
+            sessionLastSequence = 0
+        }
+
+        currentHeader = hdr
+        expectedPayloadSize = payloadNeeded
+        let hasGaps = nvmeExtents.count > 1
+        if processCompletedPayload(suppressRejectionLog: hasGaps) {
+            nvmeExtents.removeAll(keepingCapacity: true)
+            currentHeader = nil
+        } else {
+            currentHeader = nil
+        }
+    }
+
+    @discardableResult
+    private func processCompletedPayload(suppressRejectionLog: Bool = false) -> Bool {
+        guard let hdr = currentHeader else { return false }
+
+        // 1. Verify 32-bit additive checksum and CRC-32C in a single pass
+        let digests = Self.computeIntegrityDigests(payloadBuffer)
+        let calculatedChecksum = digests.checksum
 
         // v2 protects byte ordering, unlike the additive v1 checksum.  v1
         // remains accepted for compatibility but is explicitly identified in
         // reports; unknown versions were rejected before payload acceptance.
-        let calculatedCRC32C = Self.crc32c(payloadBuffer)
+        let calculatedCRC32C = digests.crc32c
         let crc32cMatches = hdr.version == FluxFrameTransportHeader.legacyVersion ||
             calculatedCRC32C == hdr.reserved
 
@@ -395,11 +579,15 @@ public final class FluxFrameTransport: @unchecked Sendable {
         let isValid = checksumMatches && pixelsMatch && crc32cMatches
 
         guard isValid else {
-            lastFrameValid = false
-            rejectedFrameCount &+= 1
-            print("⚠️ [FRAME-TRANSPORT] Integrity check failed for v\(hdr.version) seq=\(hdr.sequence): checksumMatch=\(checksumMatches) crc32cMatch=\(crc32cMatches) (calc=0x\(String(calculatedCRC32C, radix: 16)), hdr=0x\(String(hdr.reserved, radix: 16))) pixelsMatch=\(pixelsMatch); discarding frame")
-            writeStatusReport()
-            return
+            if !suppressRejectionLog {
+                // Preserve any previously validated FluxIdd frame so a single
+                // torn/reordered frame does not flicker the display back to RAMFB.
+                lastFrameValid = (latestFrameData != nil)
+                rejectedFrameCount &+= 1
+                print("⚠️ [FRAME-TRANSPORT] Integrity check failed for v\(hdr.version) seq=\(hdr.sequence): checksumMatch=\(checksumMatches) crc32cMatch=\(crc32cMatches) (calc=0x\(String(calculatedCRC32C, radix: 16)), hdr=0x\(String(hdr.reserved, radix: 16))) pixelsMatch=\(pixelsMatch); discarding frame")
+                writeStatusReport()
+            }
+            return false
         }
 
         isConnected = true
@@ -429,9 +617,16 @@ public final class FluxFrameTransport: @unchecked Sendable {
 
         FluxDisplayManager.shared.updateActiveResolution(width: Int(hdr.width), height: Int(hdr.height))
 
-        print("📸 [FRAME-TRANSPORT] v\(hdr.version) Session #\(sessionCount) Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), rowPitch=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), crc32c=0x\(String(calculatedCRC32C, radix: 16)), writes=\(currentAssemblyWriteOrdinals.count), overlap=\(currentAssemblyOverlap), duplicate=\(currentAssemblyDuplicate), noncontiguous=\(currentAssemblyNonContiguous) valid=true")
+        if frameCount == 1 || (frameCount % 30 == 0) {
+            print("📸 [FRAME-TRANSPORT] v\(hdr.version) Session #\(sessionCount) Frame #\(frameCount) received: seq=\(hdr.sequence), \(hdr.width)x\(hdr.height), rowPitch=\(hdr.stride), bytes=\(payloadBuffer.count), checksum=0x\(String(calculatedChecksum, radix: 16)), crc32c=0x\(String(calculatedCRC32C, radix: 16)), writes=\(currentAssemblyWriteOrdinals.count), overlap=\(currentAssemblyOverlap), duplicate=\(currentAssemblyDuplicate), noncontiguous=\(currentAssemblyNonContiguous) valid=true")
+        }
 
-        writeStatusReport()
+        let now = ProcessInfo.processInfo.systemUptime
+        if frameCount == 1 || (now - lastReportWriteUptime) >= 2.0 {
+            lastReportWriteUptime = now
+            writeStatusReport()
+        }
+        return true
     }
 
     // Render tracking fields
@@ -471,6 +666,20 @@ public final class FluxFrameTransport: @unchecked Sendable {
             }
         }
 
+        return (Int(lastWidth), Int(lastHeight), Int(lastStride), lastSequence)
+    }
+
+    /// Returns immutable metadata for the current validated frame.  The Metal
+    /// presenter uses this to avoid uploading an unchanged frame every draw.
+    public func latestFrameMetadata() -> (width: Int, height: Int, stride: Int, sequence: UInt32)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard latestFrameData != nil,
+              lastFrameValid,
+              lastWidth > 0,
+              lastHeight > 0 else {
+            return nil
+        }
         return (Int(lastWidth), Int(lastHeight), Int(lastStride), lastSequence)
     }
 

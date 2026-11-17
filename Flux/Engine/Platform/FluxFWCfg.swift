@@ -207,6 +207,23 @@ nonisolated final class FluxFWCfg {
             return
         }
 
+        // The framebuffer is guest-owned memory.  Reject an invalid layout at
+        // configuration time so later renderer diagnostics can safely inspect
+        // exactly `stride * height` bytes without reading beyond guest RAM.
+        let minimumStride = UInt64(width) * 4
+        let byteCount = UInt64(stride) * UInt64(height)
+        let guestBase = UInt64(memory.guestBase)
+        guard width > 0,
+              height > 0,
+              UInt64(stride) >= minimumStride,
+              addr >= guestBase,
+              addr - guestBase <= UInt64(memory.size),
+              byteCount <= UInt64(memory.size) - (addr - guestBase),
+              byteCount <= UInt64(Int.max) else {
+            print("❌ [FluxFWCfg] Invalid RAMFB layout addr=0x\(String(addr, radix: 16)) width=\(width) height=\(height) stride=\(stride)")
+            return
+        }
+
         FluxFramebuffer.shared.configure(
             guestAddress: addr,
             fourcc: fourcc,
@@ -214,7 +231,8 @@ nonisolated final class FluxFWCfg {
             width: width,
             height: height,
             stride: stride,
-            hostPointer: hostPtr
+            hostPointer: hostPtr,
+            mappedByteCapacity: Int(UInt64(memory.size) - (addr - guestBase))
         )
     }
 

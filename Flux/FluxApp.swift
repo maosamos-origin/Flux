@@ -8,7 +8,7 @@
 import SwiftUI
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static weak var shared: AppDelegate?
     private var activationObserver: Any?
 
@@ -26,6 +26,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             self?.handleApplicationDidBecomeActive()
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidBecomeMain(_:)),
+            name: NSWindow.didBecomeMainNotification,
+            object: nil
+        )
+    }
+
+    @objc func windowDidBecomeMain(_ notification: Notification) {
+        (notification.object as? NSWindow)?.delegate = self
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Closing the last window must never detach a live VM from its owner
+        // and controls. A user can minimize or hide Flux and later reactivate
+        // the same window; shutdown is always explicit and guest-initiated.
+        guard FluxSessionController.shared.isRunning else { return true }
+        sender.makeKeyAndOrderFront(nil)
+        NSApp.requestUserAttention(.informationalRequest)
+        return false
     }
 
     deinit {
@@ -73,10 +93,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct FluxApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @StateObject private var session: FluxSessionController
+
+    init() {
+        // Keep the one VM owner alive independently of SwiftUI window
+        // recreation.  Every Flux window receives this exact instance.
+        _session = StateObject(wrappedValue: FluxSessionController.shared)
+    }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(session)
+        }
+        .windowToolbarStyle(.unified(showsTitle: true))
+        .commands {
+            CommandMenu("Actions") {
+                Button("Send Ctrl+Alt+Del") {
+                    session.sendCtrlAltDel()
+                }
+                .keyboardShortcut(.delete, modifiers: [.control, .option])
+                .disabled(!session.isRunning || session.isSendingSecureAttention)
+
+                Button("Paste Mac Clipboard") {
+                    session.pasteMacClipboardToGuest()
+                }
+                .keyboardShortcut("v", modifiers: [.command, .shift])
+                .disabled(!session.isRunning || session.isPastingClipboard)
+
+                Button("Take Screenshot") {
+                    session.captureScreenshot()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(!session.isRunning)
+
+                Button("Toggle Full Screen") {
+                    session.toggleFullScreen()
+                }
+                .keyboardShortcut("f", modifiers: [.control, .command])
+
+                Divider()
+
+                Button(session.shutdownRequestPending ? "Shutdown Requested..." : "Shut Down Windows") {
+                    session.requestGuestShutdown()
+                }
+                .disabled(!session.isRunning || session.shutdownRequestPending)
+
+                Button("Restart Windows") {
+                    session.requestGuestRestart()
+                }
+                .disabled(!session.isRunning || session.shutdownRequestPending)
+            }
         }
     }
 }

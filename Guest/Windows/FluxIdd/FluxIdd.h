@@ -9,7 +9,7 @@
 constexpr wchar_t kFluxIddFriendlyName[] = L"Flux Virtual Display Adapter";
 constexpr wchar_t kFluxIddManufacturer[] = L"Flux";
 struct FluxIddMode final { UINT width; UINT height; UINT refreshHz; };
-constexpr size_t kFluxIddModeCount = 4;
+constexpr size_t kFluxIddModeCount = 7;
 extern const FluxIddMode kFluxIddModes[kFluxIddModeCount];
 
 struct FluxDeviceContext final { WDFDEVICE device; IDDCX_ADAPTER adapter; };

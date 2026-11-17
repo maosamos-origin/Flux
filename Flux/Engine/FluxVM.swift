@@ -20,6 +20,13 @@ nonisolated final class FluxVM {
     private var isShuttingDown = false
     private let platformResetLock = NSLock()
     private var isResetting = false
+    private let platformShutdownLock = NSLock()
+    private let secondaryVCPUShutdown = FluxSecondaryVCPUShutdownCoordinator()
+
+    /// A timeout is diagnostic, not permission to destroy a VM with an active
+    /// Hypervisor.framework vCPU thread.  On timeout cleanup reports the
+    /// failure and continues waiting while retaining the runtime lock.
+    private static let secondaryVCPUShutdownTimeout: TimeInterval = 5.0
 
     static var verboseExits: Bool = ProcessInfo.processInfo.environment["FLUX_VERBOSE_EXITS"] == "1"
 
@@ -112,11 +119,11 @@ nonisolated final class FluxVM {
             for cpu in vcpus {
                 cpu.requestExit()
             }
+            waitForSecondaryVCPUsToExit()
             for dev in exitHandler.virtioBlocks {
                 dev.cleanup()
             }
             exitHandler.nvme.cleanup()
-            Thread.sleep(forTimeInterval: 0.05)
             cleanup()
             print("================================")
         }
@@ -277,8 +284,20 @@ nonisolated final class FluxVM {
         for i in 1...3 {
             let secCPU = vcpus[i]
             let initSem = DispatchSemaphore(value: 0)
-            Thread.detachNewThread { [weak self] in
-                guard let self else { return }
+            guard secondaryVCPUShutdown.registerLaunch(id: secCPU.id) else {
+                print("❌ Duplicate secondary vCPU launch registration: \(secCPU.id)")
+                return
+            }
+            let shutdownCoordinator = secondaryVCPUShutdown
+            let secondaryID = secCPU.id
+            Thread.detachNewThread { [weak self, shutdownCoordinator, secCPU, secondaryID] in
+                defer {
+                    shutdownCoordinator.markExited(id: secondaryID)
+                }
+                guard let self else {
+                    initSem.signal()
+                    return
+                }
                 guard secCPU.create() else {
                     print("❌ Failed creating secondary vCPU \(secCPU.id)")
                     initSem.signal()
@@ -373,6 +392,7 @@ nonisolated final class FluxVM {
 
             // ── Canceled ───────────────────────────────
             if reason == HV_EXIT_REASON_CANCELED {
+                if isShuttingDown { break }
                 guard ProcessInfo.processInfo.environment["FLUX_VERBOSE_SAMPLER"] == "1" else {
                     continue
                 }
@@ -430,6 +450,12 @@ nonisolated final class FluxVM {
                     exitCount = 0
                     continue
                 }
+                if exitHandler.consumeSystemOffRequest() {
+                    handlePlatformShutdown()
+                    print("")
+                    print("VM stopped after \(exitCount) exits (guest power-off)")
+                    return
+                }
                 print("")
                 print("VM stopped after \(exitCount) exits")
                 return
@@ -467,6 +493,7 @@ nonisolated final class FluxVM {
                 }
 
                 if reason == HV_EXIT_REASON_CANCELED {
+                    if isShuttingDown { break }
                     continue
                 }
 
@@ -481,10 +508,15 @@ nonisolated final class FluxVM {
                         handlePlatformReset()
                         break
                     }
+                    if exitHandler.consumeSystemOffRequest() {
+                        handlePlatformShutdown()
+                        break
+                    }
                     if cpu.state != .running {
                         // CPU_OFF was executed; return to waiting for boot
                         break
                     }
+                    handlePlatformShutdown()
                     break
                 }
             }
@@ -502,6 +534,42 @@ nonisolated final class FluxVM {
             firmware: firmware,
             exitNumber: exitNumber
         )
+    }
+
+    func requestForceStop() {
+        handlePlatformShutdown()
+    }
+
+    private func handlePlatformShutdown() {
+        platformShutdownLock.lock()
+        guard !isShuttingDown else {
+            platformShutdownLock.unlock()
+            return
+        }
+        isShuttingDown = true
+        platformShutdownLock.unlock()
+
+        print("")
+        print("================================")
+        print("🛑 Platform Shutdown Requested Across All vCPUs")
+        print("================================")
+        for cpu in vcpus {
+            cpu.requestExit()
+        }
+    }
+
+    /// Waits for the secondary host threads themselves, not merely for a
+    /// momentary return from `hv_vcpu_run`.  This runs on the primary vCPU's
+    /// host thread after it has left its own run loop, so it never joins the
+    /// current thread or holds a lock required by a secondary exit path.
+    private func waitForSecondaryVCPUsToExit() {
+        if secondaryVCPUShutdown.waitForAllExits(timeout: Self.secondaryVCPUShutdownTimeout) {
+            return
+        }
+
+        let outstanding = secondaryVCPUShutdown.outstandingIDs
+        print("❌ [Shutdown] Timed out waiting for secondary vCPU thread(s): \(outstanding). Retaining VM resources and runtime lock until they exit.")
+        secondaryVCPUShutdown.waitUntilAllExited()
     }
 
     private func handlePlatformReset() {
@@ -774,6 +842,15 @@ nonisolated final class FluxVM {
 
     /// Directory for storing virtual disks inside the app's container.
     static func defaultAppDirectory() -> String {
+        // A launch-only override keeps a diagnostic build attached to the
+        // already-provisioned runtime set (target disk, UEFI vars, lock, and
+        // optional media) instead of silently selecting a second Application
+        // Support directory when it is started through LaunchServices.
+        if let override = ProcessInfo.processInfo.environment["FLUX_APP_SUPPORT_DIR"],
+           FileManager.default.fileExists(atPath: override) {
+            return override
+        }
+
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -894,6 +971,10 @@ nonisolated final class FluxVM {
     }
 
     private func cleanup() {
+
+        // Diagnostic storage must never retain a live VM. Preserve queued
+        // telemetry when possible, but bound teardown wait time.
+        _ = FluxInputDiagnostics.flush(timeout: 0.25)
 
         // The Metal display may render after the run loop exits.  Remove its
         // borrowed guest-RAM pointer before unmapping that allocation.

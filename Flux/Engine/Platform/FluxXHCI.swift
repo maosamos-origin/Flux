@@ -1195,7 +1195,9 @@ nonisolated final class FluxXHCI {
                 0x00,       // bCountryCode = 0
                 0x01,       // bNumDescriptors = 1
                 0x22,       // bDescriptorType = Report
-                0x3F, 0x00, // wDescriptorLength = 63 bytes (0x003F)
+                FluxPointerInputProtocol.reportDescriptorLengthLittleEndian[0],
+                FluxPointerInputProtocol.reportDescriptorLengthLittleEndian[1],
+                // wDescriptorLength = pointer report descriptor bytes
 
                 // Endpoint Descriptor 1 (7 bytes)
                 0x07,       // bLength
@@ -1243,40 +1245,7 @@ nonisolated final class FluxXHCI {
             ]
         } else {
             descName = "GET_DESCRIPTOR(HID Report Pointer)"
-            descriptor = [
-                0x05, 0x01, // Usage Page (Generic Desktop)
-                0x09, 0x02, // Usage (Mouse)
-                0xA1, 0x01, // Collection (Application)
-                0x09, 0x01, //   Usage (Pointer)
-                0xA1, 0x00, //   Collection (Physical)
-                0x05, 0x09, //     Usage Page (Button)
-                0x19, 0x01, //     Usage Minimum (1) - Button 1 (Left)
-                0x29, 0x03, //     Usage Maximum (3) - Button 3 (Middle)
-                0x15, 0x00, //     Logical Minimum (0)
-                0x25, 0x01, //     Logical Maximum (1)
-                0x95, 0x03, //     Report Count (3)
-                0x75, 0x01, //     Report Size (1)
-                0x81, 0x02, //     Input (Data, Variable, Absolute) - 3 buttons
-                0x95, 0x01, //     Report Count (1)
-                0x75, 0x05, //     Report Size (5)
-                0x81, 0x01, //     Input (Constant) - Padding (5 bits)
-                0x05, 0x01, //     Usage Page (Generic Desktop)
-                0x09, 0x30, //     Usage (X)
-                0x09, 0x31, //     Usage (Y)
-                0x15, 0x00, //     Logical Minimum (0)
-                0x26, 0xFF, 0x7F, // Logical Maximum (32767)
-                0x75, 0x10, //     Report Size (16)
-                0x95, 0x02, //     Report Count (2)
-                0x81, 0x02, //     Input (Data, Variable, Absolute) - X, Y
-                0x09, 0x38, //     Usage (Wheel)
-                0x15, 0x81, //     Logical Minimum (-127)
-                0x25, 0x7F, //     Logical Maximum (127)
-                0x75, 0x08, //     Report Size (8)
-                0x95, 0x01, //     Report Count (1)
-                0x81, 0x06, //     Input (Data, Variable, Relative) - Vertical Wheel
-                0xC0,       //   End Collection
-                0xC0,       // End Collection
-            ]
+            descriptor = FluxPointerInputProtocol.reportDescriptor
         }
         let payloadLength = min(descriptor.count, Int(requestedLength), Int(dataLength))
         guard payloadLength > 0,
@@ -1518,13 +1487,22 @@ nonisolated final class FluxXHCI {
             }
         }
 
-        let writeLen = min(report.count, Int(reqLen))
-        guard writeLen > 0, let buf = ptr(trbParam, bytes: writeLen) else {
+        guard report.count == FluxHIDPointer.reportLength,
+              FluxPointerInputProtocol.endpointCanCarryReport(requestLength: Int(reqLen), maxPacketSize: Int(mps)) else {
+            print("⚠️ FluxXHCI EP5: refusing incompatible pointer report reportLen=\(report.count) required=\(FluxHIDPointer.reportLength) reqLen=\(reqLen) mps=\(mps); not consumed")
+            return nil
+        }
+        let writeLen = report.count
+        guard let buf = ptr(trbParam, bytes: writeLen) else {
             print("⚠️ FluxXHCI EP5: invalid buffer GPA=0x\(String(trbParam, radix: 16)) len=\(writeLen); not consumed")
             return nil
         }
         report.withUnsafeBytes { buf.copyMemory(from: $0.baseAddress!, byteCount: writeLen) }
         _ = FluxHIDPointer.shared.popReport()
+        FluxHIDPointer.appendInputDiagnostic(
+            stage: "XHCI_EP5",
+            detail: "report=\(report.map { String(format: "%02x", $0) }.joined(separator: "")) writeLen=\(writeLen) completion=\(writeLen < Int(reqLen) ? 13 : 1)"
+        )
         print("[XHCI-EP5-REPORT] wrote \(writeLen) bytes to buffer GPA=0x\(String(trbParam, radix: 16)) [\(report.map { String(format: "%02x", $0) }.joined(separator: " "))]")
 
         // Update TR Dequeue Pointer in Endpoint 5 Context

@@ -12,16 +12,23 @@ public final class FluxDisplayManager: ObservableObject, @unchecked Sendable {
 
     @Published public private(set) var activeWidth: Int = 800
     @Published public private(set) var activeHeight: Int = 600
+    @Published public private(set) var activeRenderSource: String = "RAMFB"
+    @Published public private(set) var currentFPS: Double = 0
+    @Published public var autoResizeEnabled: Bool = true
+    @Published public var fillScreen: Bool = false
     public private(set) var lastRequestedWidth: Int = 0
     public private(set) var lastRequestedHeight: Int = 0
     public private(set) var isSwitchingMode: Bool = false
     public private(set) var modeSwitchCount: Int = 0
 
-    /// Exact 4 display modes supported by FluxIdd for dynamic desktop synchronization.
+    /// Display modes matching FluxIdd (`Monitor.cpp`) for dynamic desktop synchronization.
     public static let supportedModes: [(width: Int, height: Int)] = [
         (800, 600),    // SVGA compatibility fallback
         (1280, 720),   // 16:9 HD
+        (1280, 800),   // 16:10 MacBook
+        (1440, 900),   // 16:10 MacBook
         (1600, 900),   // 16:9 HD+
+        (1680, 1050),  // 16:10 WSXGA+
         (1920, 1080)   // 16:9 Full HD
     ]
 
@@ -43,6 +50,19 @@ public final class FluxDisplayManager: ObservableObject, @unchecked Sendable {
             self.objectWillChange.send()
         }
         print("🖥️ [DYNAMIC-RESO] Active resolution updated to: \(width)x\(height) (switches=\(modeSwitchCount))")
+    }
+
+    /// Updates lightweight display telemetry (render source and FPS) for the macOS toolbar.
+    public func updateRenderTelemetry(source: String, fps: Double) {
+        let roundedFPS = (fps * 10).rounded() / 10
+        DispatchQueue.main.async {
+            if self.activeRenderSource != source {
+                self.activeRenderSource = source
+            }
+            if abs(self.currentFPS - roundedFPS) >= 0.5 {
+                self.currentFPS = roundedFPS
+            }
+        }
     }
 
     /// Chooses the optimal guest resolution matching the host viewport aspect ratio and size.

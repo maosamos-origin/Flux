@@ -43,12 +43,21 @@ nonisolated final class FluxExitHandler {
     private let oslarLock = NSLock()
     private var systemResetRequested = false
     private let resetLock = NSLock()
+    private var systemOffRequested = false
+    private let powerOffLock = NSLock()
 
     func consumeSystemResetRequest() -> Bool {
         resetLock.lock()
         defer { resetLock.unlock() }
         defer { systemResetRequested = false }
         return systemResetRequested
+    }
+
+    func consumeSystemOffRequest() -> Bool {
+        powerOffLock.lock()
+        defer { powerOffLock.unlock() }
+        defer { systemOffRequested = false }
+        return systemOffRequested
     }
 
     func handle(
@@ -818,8 +827,8 @@ nonisolated final class FluxExitHandler {
                 return false
             }
 
-            // EC 0x16 = HVC executed in AArch64 state
-            guard exceptionClass == 0x16 else {
+            // EC 0x16 = HVC executed in AArch64 state, EC 0x17 = SMC executed in AArch64 state
+            guard exceptionClass == 0x16 || exceptionClass == 0x17 else {
 
                 print("")
                 print("================================")
@@ -913,6 +922,9 @@ nonisolated final class FluxExitHandler {
             case .systemOff:
                 print("")
                 print("🛑 Guest requested system off")
+                powerOffLock.lock()
+                systemOffRequested = true
+                powerOffLock.unlock()
                 return false
 
             case .systemReset:
