@@ -403,6 +403,8 @@ nonisolated final class FluxNVMe {
                 }
                 numNamespaces = 2
                 print("📀 FluxNVMe: Configured Namespace 2 (Installer/Media) sectors=\(installerSectors)")
+                FluxClipboardBridge.shared.locateInboundChannel(fd: installerFD, fileSize: UInt64(instSt.st_size))
+                FluxClipboardBridge.shared.startMonitoring()
 
                 // Dynamically discover FAT32 data cluster offset from the boot record to avoid hardcoded offsets
                 var detectedDataOffset: UInt64 = 0
@@ -1632,6 +1634,16 @@ nonisolated final class FluxNVMe {
 
         switch req.opc {
         case 0x02: // Read
+            if req.nsid == 2,
+               FluxClipboardBridge.shared.handleNS2Read(
+                   fileOffset: UInt64(req.fileOffset),
+                   iovs: req.iovs,
+                   totalBytes: req.totalBytes
+               ) {
+                validationUpdate { $0.readBytes += UInt64(req.totalBytes) }
+                completeIORequest(generation: req.generation, sqid: req.sqid, cqId: req.cqId, cid: req.cid, dw0: 0, status: 0)
+                return
+            }
             if req.fd >= 0 && !req.iovs.isEmpty {
                 var localIovs = req.iovs
                 let bytesRead = preadv(req.fd, &localIovs, Int32(localIovs.count), req.fileOffset)
@@ -1667,6 +1679,7 @@ nonisolated final class FluxNVMe {
                     var iovOffset = 0
                     for iov in req.iovs {
                         if let base = iov.iov_base, iov.iov_len > 0 {
+                            FluxClipboardBridge.shared.consumeWrite(base, count: iov.iov_len)
                             FluxFrameTransport.shared.consumeBytes(
                                 base, count: iov.iov_len,
                                 sourceOffset: UInt64(req.fileOffset + off_t(iovOffset)),

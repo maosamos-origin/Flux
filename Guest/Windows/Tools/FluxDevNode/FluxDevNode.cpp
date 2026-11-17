@@ -1191,6 +1191,124 @@ LONG SetResolution(DWORD width, DWORD height, const wchar_t* explicitDeviceName 
     return result;
 }
 
+static UINT32 FluxClipCrc32c(const BYTE* data, DWORD length) {
+    UINT32 crc = 0xFFFFFFFFu;
+    for (DWORD i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc >> 1) ^ ((crc & 1u) ? 0x82F63B78u : 0u);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+struct ClipboardBridgeState {
+    BYTE* alignedReadBuf = nullptr;
+    DWORD lastHostSeq = 0;
+    DWORD lastWinClipSeq = 0;
+    DWORD lastSuppressedWinClipSeq = 0;
+    DWORD outSeq = 0;
+};
+
+static void PollClipboardBridge(ClipboardBridgeState& st) {
+#if __has_include(<windows.h>)
+    if (!st.alignedReadBuf) {
+        st.alignedReadBuf = static_cast<BYTE*>(VirtualAlloc(nullptr, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        st.lastWinClipSeq = GetClipboardSequenceNumber();
+    }
+
+    // 1. Host -> Guest (Mac -> Windows) via unbuffered read of D:\flux_clipboard_in.bin
+    if (st.alignedReadBuf) {
+        HANDLE hIn = CreateFileW(L"D:\\flux_clipboard_in.bin", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+        if (hIn != INVALID_HANDLE_VALUE) {
+            DWORD bytesRead = 0;
+            BOOL ok = ReadFile(hIn, st.alignedReadBuf, 65536, &bytesRead, nullptr);
+            CloseHandle(hIn);
+            if (ok && bytesRead >= 20) {
+                const char* m = reinterpret_cast<const char*>(st.alignedReadBuf);
+                if (m[0] == 'F' && m[1] == 'L' && m[2] == 'X' && m[3] == 'C' &&
+                    m[4] == 'L' && m[5] == 'I' && m[6] == 'P' && m[7] == '1') {
+                    DWORD seq = *reinterpret_cast<const DWORD*>(st.alignedReadBuf + 8);
+                    DWORD len = *reinterpret_cast<const DWORD*>(st.alignedReadBuf + 12);
+                    DWORD expectedCRC = *reinterpret_cast<const DWORD*>(st.alignedReadBuf + 16);
+                    if (seq != 0 && seq != st.lastHostSeq && len > 0 && len <= 60000 && 20 + len <= bytesRead) {
+                        const BYTE* payload = st.alignedReadBuf + 20;
+                        if (FluxClipCrc32c(payload, len) == expectedCRC) {
+                            st.lastHostSeq = seq;
+                            int wchars = MultiByteToWideChar(CP_UTF8, 0, reinterpret_cast<const char*>(payload), static_cast<int>(len), nullptr, 0);
+                            if (wchars > 0) {
+                                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(wchars + 1) * sizeof(wchar_t));
+                                if (hMem) {
+                                    wchar_t* dst = static_cast<wchar_t*>(GlobalLock(hMem));
+                                    if (dst) {
+                                        MultiByteToWideChar(CP_UTF8, 0, reinterpret_cast<const char*>(payload), static_cast<int>(len), dst, wchars);
+                                        dst[wchars] = L'\0';
+                                        GlobalUnlock(hMem);
+                                        if (OpenClipboard(nullptr)) {
+                                            EmptyClipboard();
+                                            if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+                                                GlobalFree(hMem);
+                                            }
+                                            CloseClipboard();
+                                            st.lastSuppressedWinClipSeq = GetClipboardSequenceNumber();
+                                            st.lastWinClipSeq = st.lastSuppressedWinClipSeq;
+                                        } else {
+                                            GlobalFree(hMem);
+                                        }
+                                    } else {
+                                        GlobalFree(hMem);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Guest -> Host (Windows -> Mac) via write to D:\flux_clipboard_out.bin
+    DWORD curClipSeq = GetClipboardSequenceNumber();
+    if (curClipSeq != st.lastWinClipSeq && curClipSeq != st.lastSuppressedWinClipSeq) {
+        st.lastWinClipSeq = curClipSeq;
+        if (OpenClipboard(nullptr)) {
+            HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+            if (hData) {
+                const wchar_t* wtext = static_cast<const wchar_t*>(GlobalLock(hData));
+                if (wtext) {
+                    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wtext, -1, nullptr, 0, nullptr, nullptr);
+                    if (utf8Len > 1) {
+                        DWORD payloadLen = static_cast<DWORD>(utf8Len - 1);
+                        if (payloadLen > 60000) payloadLen = 60000;
+                        BYTE outBuf[20 + 60000] = {};
+                        outBuf[0] = 'F'; outBuf[1] = 'L'; outBuf[2] = 'X'; outBuf[3] = 'C';
+                        outBuf[4] = 'L'; outBuf[5] = 'I'; outBuf[6] = 'P'; outBuf[7] = '2';
+                        st.outSeq++;
+                        *reinterpret_cast<DWORD*>(outBuf + 8) = st.outSeq;
+                        *reinterpret_cast<DWORD*>(outBuf + 12) = payloadLen;
+                        WideCharToMultiByte(CP_UTF8, 0, wtext, -1, reinterpret_cast<char*>(outBuf + 20), static_cast<int>(payloadLen), nullptr, nullptr);
+                        *reinterpret_cast<DWORD*>(outBuf + 16) = FluxClipCrc32c(outBuf + 20, payloadLen);
+
+                        HANDLE hOut = CreateFileW(L"D:\\flux_clipboard_out.bin", GENERIC_WRITE, FILE_SHARE_READ,
+                                                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        if (hOut != INVALID_HANDLE_VALUE) {
+                            DWORD written = 0;
+                            WriteFile(hOut, outBuf, 20 + payloadLen, &written, nullptr);
+                            CloseHandle(hOut);
+                        }
+                    }
+                    GlobalUnlock(hData);
+                }
+            }
+            CloseClipboard();
+        }
+    }
+#else
+    (void)st;
+#endif
+}
+
 bool RunResAgent(const wchar_t* requestPath, DWORD pollIntervalMs) {
     if (!requestPath || requestPath[0] == L'\0') {
         requestPath = L"D:\\flux_resolution_request.txt";
@@ -1210,6 +1328,7 @@ bool RunResAgent(const wchar_t* requestPath, DWORD pollIntervalMs) {
     OutDec(L"RESAGENT_POLL_INTERVAL_MS=", pollIntervalMs);
     OutLine(L"RESAGENT_STATUS=RUNNING");
 
+    ClipboardBridgeState clipState;
     DWORD elapsedMs = 0;
     while (true) {
         DWORD wr = WaitForSingleObject(hStopEvent, pollIntervalMs);
@@ -1217,6 +1336,8 @@ bool RunResAgent(const wchar_t* requestPath, DWORD pollIntervalMs) {
             OutLine(L"RESAGENT_STOP_REASON=STOP_SIGNALED");
             break;
         }
+
+        PollClipboardBridge(clipState);
 
         elapsedMs += pollIntervalMs;
         if (elapsedMs % 30000 < pollIntervalMs) {
